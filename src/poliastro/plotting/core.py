@@ -51,6 +51,7 @@ class _PlotlyOrbitPlotter(BaseOrbitPlotter):
             Fade the orbit trail, default to False.
 
         """
+
         super().plot_trajectory(coordinates, label=label, color=color, trail=trail)
 
         if not self._figure._in_batch_mode:
@@ -77,13 +78,19 @@ class _PlotlyOrbitPlotter(BaseOrbitPlotter):
             return self.show()
 
     def plot_body_orbit(
-        self, body, epoch, *, label=None, color=None, trail=False,
+        self,
+        body,
+        epoch,
+        *,
+        label=None,
+        color=None,
+        trail=False,
     ):
         """Plots complete revolution of body and current position.
 
         Parameters
         ----------
-        body : poliastro.bodies.SolarSystemBody
+        body : poliastro.bodies.SolarSystemPlanet
             Body.
         epoch : astropy.time.Time
             Epoch of current position.
@@ -96,6 +103,29 @@ class _PlotlyOrbitPlotter(BaseOrbitPlotter):
 
         """
         super().plot_body_orbit(body, epoch, label=label, color=color, trail=trail)
+
+        if not self._figure._in_batch_mode:
+            return self.show()
+
+    def plot_ephem(self, ephem, epoch=None, *, label=None, color=None, trail=False):
+        """Plots Ephem object over its sampling period.
+
+        Parameters
+        ----------
+        ephem : ~poliastro.ephem.Ephem
+            Ephemerides to plot.
+        epoch : astropy.time.Time, optional
+            Epoch of the current position, none will be used if not given.
+        label : str, optional
+            Label of the orbit, default to the name of the body.
+        color : string, optional
+            Color of the line and the position.
+        trail : bool, optional
+            Fade the orbit trail, default to False.
+
+        """
+
+        super().plot_ephem(ephem, epoch, label=label, color=color, trail=trail)
 
         if not self._figure._in_batch_mode:
             return self.show()
@@ -114,9 +144,7 @@ class _PlotlyOrbitPlotter(BaseOrbitPlotter):
 
 
 class OrbitPlotter3D(_PlotlyOrbitPlotter):
-    """OrbitPlotter3D class.
-
-    """
+    """OrbitPlotter3D class."""
 
     def __init__(self, figure=None, dark=False, *, num_points=150, plane=None):
         super().__init__(figure, num_points=num_points, plane=plane)
@@ -190,9 +218,7 @@ class OrbitPlotter3D(_PlotlyOrbitPlotter):
 
     @u.quantity_input(elev=u.rad, azim=u.rad, distance=u.km)
     def set_view(self, elev, azim, distance=5 * u.km):
-        """Changes 3D view.
-
-        """
+        """Changes 3D view."""
         x = distance * np.cos(elev) * np.cos(azim)
         y = distance * np.cos(elev) * np.sin(azim)
         z = distance * np.sin(elev)
@@ -322,6 +348,30 @@ class OrbitPlotter2D(_PlotlyOrbitPlotter, Mixin2D):
             coordinates, label=label, color=color, trail=trail
         )
 
+    def plot_ephem(self, ephem, epoch=None, *, label=None, color=None, trail=False):
+        """Plots Ephem object over its sampling period.
+
+        Parameters
+        ----------
+        ephem : ~poliastro.ephem.Ephem
+            Ephemerides to plot.
+        epoch : astropy.time.Time, optional
+            Epoch of the current position, none will be used if not given.
+        label : str, optional
+            Label of the orbit, default to the name of the body.
+        color : string, optional
+            Color of the line and the position.
+        trail : bool, optional
+            Fade the orbit trail, default to False.
+
+        """
+        if self._frame is None:
+            raise ValueError(
+                "A frame must be set up first, please use "
+                "set_orbit_frame(orbit) or plot(orbit)"
+            )
+        super().plot_ephem(ephem, epoch, label=label, color=color, trail=trail)
+
     def plot(self, orbit, *, label=None, color=None, trail=False):
         """Plots state and osculating orbit in their plane.
 
@@ -337,6 +387,7 @@ class OrbitPlotter2D(_PlotlyOrbitPlotter, Mixin2D):
             Fade the orbit trail, default to False.
 
         """
+
         if trail:
             raise NotImplementedError("trail not supported yet")
 
@@ -359,7 +410,7 @@ class OrbitPlotter2D(_PlotlyOrbitPlotter, Mixin2D):
 
         Parameters
         ----------
-        body : poliastro.bodies.SolarSystemBody
+        body : poliastro.bodies.SolarSystemPlanet
             Body.
         epoch : astropy.time.Time
             Epoch of current position.

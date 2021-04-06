@@ -1,11 +1,10 @@
 import numpy as np
-
-from ._jit import jit
+from numba import njit as jit
 
 
 @jit
 def _kepler_equation(E, M, ecc):
-    return E - ecc * np.sin(E) - M
+    return E_to_M(E, ecc) - M
 
 
 @jit
@@ -15,7 +14,7 @@ def _kepler_equation_prime(E, M, ecc):
 
 @jit
 def _kepler_equation_hyper(F, M, ecc):
-    return -F + ecc * np.sinh(F) - M
+    return F_to_M(F, ecc) - M
 
 
 @jit
@@ -24,56 +23,10 @@ def _kepler_equation_prime_hyper(F, M, ecc):
 
 
 @jit
-def _kepler_equation_parabolic(D, M, ecc):
-    return M_parabolic(ecc, D) - M
-
-
-@jit
-def _kepler_equation_prime_parabolic(D, M, ecc):
-    return M_parabolic_prime(ecc, D)
-
-
-@jit
-def M_parabolic(ecc, D, tolerance=1e-16):
-    x = (ecc - 1.0) / (ecc + 1.0) * (D ** 2)
-    small_term = False
-    S = 0.0
-    k = 0
-    while not small_term:
-        term = (ecc - 1.0 / (2.0 * k + 3.0)) * (x ** k)
-        small_term = np.abs(term) < tolerance
-        S += term
-        k += 1
-    return (
-        np.sqrt(2.0 / (1.0 + ecc)) * D + np.sqrt(2.0 / (1.0 + ecc) ** 3) * (D ** 3) * S
-    )
-
-
-@jit
-def M_parabolic_prime(ecc, D, tolerance=1e-16):
-    x = (ecc - 1.0) / (ecc + 1.0) * (D ** 2)
-    small_term = False
-    S_prime = 0.0
-    k = 0
-    while not small_term:
-        term = (ecc - 1.0 / (2.0 * k + 3.0)) * (2 * k + 3.0) * (x ** k)
-        small_term = np.abs(term) < tolerance
-        S_prime += term
-        k += 1
-    return (
-        np.sqrt(2.0 / (1.0 + ecc))
-        + np.sqrt(2.0 / (1.0 + ecc) ** 3) * (D ** 2) * S_prime
-    )
-
-
-@jit
 def newton(regime, x0, args=(), tol=1.48e-08, maxiter=50):
     p0 = 1.0 * x0
     for iter in range(maxiter):
-        if regime == "parabolic":
-            fval = _kepler_equation_parabolic(p0, *args)
-            fder = _kepler_equation_prime_parabolic(p0, *args)
-        elif regime == "hyperbolic":
+        if regime == "hyperbolic":
             fval = _kepler_equation_hyper(p0, *args)
             fder = _kepler_equation_prime_hyper(p0, *args)
         else:
@@ -85,16 +38,13 @@ def newton(regime, x0, args=(), tol=1.48e-08, maxiter=50):
         if abs(p - p0) < tol:
             return p
         p0 = p
-    return 1.0
+
+    return np.nan
 
 
 @jit
 def D_to_nu(D):
-    r"""True anomaly from parabolic eccentric anomaly.
-
-    .. math::
-
-        \nu = 2 \cdot \arctan{(D)}
+    r"""True anomaly from parabolic anomaly.
 
     Parameters
     ----------
@@ -106,11 +56,14 @@ def D_to_nu(D):
     nu : float
         True anomaly.
 
-    Note
-    ----
-    Taken from Farnocchia, Davide, Davide Bracali Cioci, and Andrea Milani.
-    "Robust resolution of Kepler’s equation in all eccentricity regimes."
-    Celes
+    Notes
+    -----
+    From [1]_:
+
+    .. math::
+
+        \nu = 2 \arctan{D}
+
     """
 
     return 2.0 * np.arctan(D)
@@ -118,10 +71,7 @@ def D_to_nu(D):
 
 @jit
 def nu_to_D(nu):
-    r"""Parabolic eccentric anomaly from true anomaly.
-
-    .. math::
-        D = \tan{\frac{\nu}{2}}
+    r"""Parabolic anomaly from true anomaly.
 
     Parameters
     ----------
@@ -131,14 +81,43 @@ def nu_to_D(nu):
     Returns
     -------
     D : float
-        Hyperbolic eccentric anomaly.
+        Parabolic anomaly.
 
-    Note
-    ----
-    Taken from Farnocchia, Davide, Davide Bracali Cioci, and Andrea Milani.
-    "Robust resolution of Kepler’s equation in all eccentricity regimes."
-    Celestial Mechanics and Dynamical Astronomy 116, no. 1 (2013): 21-34.
+    Warnings
+    --------
+    The parabolic anomaly will be continuous in (-∞, ∞)
+    only if the true anomaly is in (-π, π].
+    No validation or wrapping is performed.
+
+    Notes
+    -----
+    The treatment of the parabolic case is heterogeneous in the literature,
+    and that includes the use of an equivalent quantity to the eccentric anomaly:
+    [1]_ calls it "parabolic eccentric anomaly" D,
+    [2]_ also uses the letter D but calls it just "parabolic anomaly",
+    [3]_ uses the letter B citing indirectly [4]_
+    (which however calls it "parabolic time argument"),
+    and [5]_ does not bother to define it.
+
+    We use this definition:
+
+    .. math::
+
+        B = \tan{\frac{\nu}{2}}
+
+    References
+    ----------
+    .. [1] Farnocchia, Davide, Davide Bracali Cioci, and Andrea Milani.
+       "Robust resolution of Kepler’s equation in all eccentricity regimes."
+    .. [2] Bate, Muller, White.
+    .. [3] Vallado, David. "Fundamentals of Astrodynamics and Applications",
+       2013.
+    .. [4] IAU VIth General Assembly, 1938.
+    .. [5] Battin, Richard H. "An introduction to the Mathematics and Methods
+       of Astrodynamics, Revised Edition", 1999.
+
     """
+    # TODO: Rename to B
     return np.tan(nu / 2.0)
 
 
@@ -147,9 +126,6 @@ def nu_to_E(nu, ecc):
     r"""Eccentric anomaly from true anomaly.
 
     .. versionadded:: 0.4.0
-
-    .. math::
-        E = 2\arctan{\sqrt{\frac{1-e}{1+e}}\tan{\frac{\nu}{2}}}
 
     Parameters
     ----------
@@ -161,21 +137,29 @@ def nu_to_E(nu, ecc):
     Returns
     -------
     E : float
-        Eccentric anomaly.
+        Eccentric anomaly, between -π and π radians.
+
+    Warnings
+    --------
+    The eccentric anomaly will be between -π and π radians,
+    no matter the value of the true anomaly.
+
+    Notes
+    -----
+    The implementation uses the half-angle formula from [3]_:
+
+    .. math::
+        E = 2 \arctan \left ( \sqrt{\frac{1 - e}{1 + e}} \tan{\frac{\nu}{2}} \right)
+        \in (-\pi, \pi]
 
     """
-
-    beta = ecc / (1 + np.sqrt(1 - (ecc ** 2)))
-    E = nu - 2 * np.arctan(beta * np.sin(nu) / (1 + beta * np.cos(nu)))
+    E = 2 * np.arctan(np.sqrt((1 - ecc) / (1 + ecc)) * np.tan(nu / 2))
     return E
 
 
 @jit
 def nu_to_F(nu, ecc):
-    r"""Hyperbolic eccentric anomaly from true anomaly.
-
-    .. math::
-        F = ln{\left ( \frac{\sin{(\nu)}\sqrt{e^{2}-1} + \cos{\nu} + e}{1+e\cos{(\nu)}} \right )}
+    r"""Hyperbolic anomaly from true anomaly.
 
     Parameters
     ----------
@@ -187,17 +171,25 @@ def nu_to_F(nu, ecc):
     Returns
     -------
     F : float
-        Hyperbolic eccentric anomaly.
+        Hyperbolic anomaly.
 
-    Note
+    Warnings
+    --------
+    The hyperbolic anomaly will be continuous in (-∞, ∞)
+    only if the true anomaly is in (-π, π],
+    which should happen anyway
+    because the true anomaly is limited for hyperbolic orbits.
+    No validation or wrapping is performed.
+
+    Notes
     -----
-    Taken from Curtis, H. (2013). *Orbital mechanics for engineering students*. 167
+    The implementation uses the half-angle formula from [3]_:
+
+    .. math::
+        F = 2 \operatorname{arctanh} \left( \sqrt{\frac{e-1}{e+1}} \tan{\frac{\nu}{2}} \right)
 
     """
-    F = np.log(
-        (np.sqrt(ecc + 1) + np.sqrt(ecc - 1) * np.tan(nu / 2))
-        / (np.sqrt(ecc + 1) - np.sqrt(ecc - 1) * np.tan(nu / 2))
-    )
+    F = 2 * np.arctanh(np.sqrt((ecc - 1) / (ecc + 1)) * np.tan(nu / 2))
     return F
 
 
@@ -206,9 +198,6 @@ def E_to_nu(E, ecc):
     r"""True anomaly from eccentric anomaly.
 
     .. versionadded:: 0.4.0
-
-    .. math::
-        \nu = 2\arctan{\left ( \sqrt{\frac{1+e}{1-e}}\tan{\frac{E}{2}} \right )}
 
     Parameters
     ----------
@@ -220,22 +209,34 @@ def E_to_nu(E, ecc):
     Returns
     -------
     nu : float
-        True anomaly.
+        True anomaly, between -π and π radians.
+
+    Warnings
+    --------
+    The true anomaly will be between -π and π radians,
+    no matter the value of the eccentric anomaly.
+
+    Notes
+    -----
+    The implementation uses the half-angle formula from [3]_:
+
+    .. math::
+        \nu = 2 \arctan \left( \sqrt{\frac{1 + e}{1 - e}} \tan{\frac{E}{2}} \right)
+        \in (-\pi, \pi]
 
     """
-    beta = ecc / (1 + np.sqrt((1 - ecc) * (1 + ecc)))
-    nu = E + 2 * np.arctan(beta * np.sin(E) / (1 - beta * np.cos(E)))
+    nu = 2 * np.arctan(np.sqrt((1 + ecc) / (1 - ecc)) * np.tan(E / 2))
     return nu
 
 
 @jit
 def F_to_nu(F, ecc):
-    """True anomaly from hyperbolic eccentric anomaly.
+    r"""True anomaly from hyperbolic anomaly.
 
     Parameters
     ----------
     F : float
-        Hyperbolic eccentric anomaly.
+        Hyperbolic anomaly.
     ecc : float
         Eccentricity (>1).
 
@@ -244,11 +245,16 @@ def F_to_nu(F, ecc):
     nu : float
         True anomaly.
 
+    Notes
+    -----
+    The implementation uses the half-angle formula from [3]_:
+
+    .. math::
+        \nu = 2 \arctan \left( \sqrt{\frac{e + 1}{e - 1}} \tanh{\frac{F}{2}} \right)
+        \in (-\pi, \pi]
+
     """
-    nu = 2 * np.arctan(
-        (np.exp(F) * np.sqrt(ecc + 1) - np.sqrt(ecc + 1))
-        / (np.exp(F) * np.sqrt(ecc - 1) + np.sqrt(ecc - 1))
-    )
+    nu = 2 * np.arctan(np.sqrt((ecc + 1) / (ecc - 1)) * np.tanh(F / 2))
     return nu
 
 
@@ -270,14 +276,23 @@ def M_to_E(M, ecc):
     E : float
         Eccentric anomaly.
 
+    Notes
+    -----
+    This uses a Newton iteration on the Kepler equation.
+
     """
-    E = newton("elliptic", M, args=(M, ecc))
+    assert -np.pi <= M <= np.pi
+    if ecc < 0.8:
+        E0 = M
+    else:
+        E0 = np.pi * np.sign(M)
+    E = newton("elliptic", E0, args=(M, ecc))
     return E
 
 
 @jit
 def M_to_F(M, ecc):
-    """Hyperbolic eccentric anomaly from mean anomaly.
+    """Hyperbolic anomaly from mean anomaly.
 
     Parameters
     ----------
@@ -289,40 +304,46 @@ def M_to_F(M, ecc):
     Returns
     -------
     F : float
-        Hyperbolic eccentric anomaly.
+        Hyperbolic anomaly.
+
+    Notes
+    -----
+    This uses a Newton iteration on the hyperbolic Kepler equation.
 
     """
-    F = newton("hyperbolic", np.arcsinh(M / ecc), args=(M, ecc), maxiter=100)
+    F0 = np.arcsinh(M / ecc)
+    F = newton("hyperbolic", F0, args=(M, ecc), maxiter=100)
     return F
 
 
 @jit
-def M_to_D(M, ecc):
-    """Parabolic eccentric anomaly from mean anomaly.
+def M_to_D(M):
+    """Parabolic anomaly from mean anomaly.
 
     Parameters
     ----------
     M : float
         Mean anomaly in radians.
-    ecc : float
-        Eccentricity (>1).
 
     Returns
     -------
     D : float
-        Parabolic eccentric anomaly.
+        Parabolic anomaly.
+
+    Notes
+    -----
+    This uses the analytical solution of Barker's equation from [5]_.
 
     """
     B = 3.0 * M / 2.0
     A = (B + (1.0 + B ** 2) ** 0.5) ** (2.0 / 3.0)
-    guess = 2 * A * B / (1 + A + A ** 2)
-    D = newton("parabolic", guess, args=(M, ecc), maxiter=100)
+    D = 2 * A * B / (1 + A + A ** 2)
     return D
 
 
 @jit
 def E_to_M(E, ecc):
-    """Mean anomaly from eccentric anomaly.
+    r"""Mean anomaly from eccentric anomaly.
 
     .. versionadded:: 0.4.0
 
@@ -338,19 +359,32 @@ def E_to_M(E, ecc):
     M : float
         Mean anomaly.
 
+    Warnings
+    --------
+    The mean anomaly will be outside of (-π, π]
+    if the eccentric anomaly is.
+    No validation or wrapping is performed.
+
+    Notes
+    -----
+    The implementation uses the plain original Kepler equation:
+
+    .. math::
+        M = E - e \sin{E}
+
     """
-    M = _kepler_equation(E, 0.0, ecc)
+    M = E - ecc * np.sin(E)
     return M
 
 
 @jit
 def F_to_M(F, ecc):
-    """Mean anomaly from eccentric anomaly.
+    r"""Mean anomaly from eccentric anomaly.
 
     Parameters
     ----------
     F : float
-        Hyperbolic eccentric anomaly.
+        Hyperbolic anomaly.
     ecc : float
         Eccentricity (>1).
 
@@ -359,110 +393,58 @@ def F_to_M(F, ecc):
     M : float
         Mean anomaly.
 
+    Notes
+    -----
+    As noted in [5]_, by manipulating
+    the parametric equations of the hyperbola
+    we can derive a quantity that is equivalent
+    to the eccentric anomaly in the elliptic case:
+
+    .. math::
+
+        M = e \sinh{F} - F
+
     """
-    M = _kepler_equation_hyper(F, 0.0, ecc)
+    M = ecc * np.sinh(F) - F
     return M
 
 
 @jit
-def D_to_M(D, ecc):
-    """Mean anomaly from eccentric anomaly.
+def D_to_M(D):
+    r"""Mean anomaly from parabolic anomaly.
 
     Parameters
     ----------
     D : float
-        Parabolic eccentric anomaly.
-    ecc : float
-        Eccentricity.
+        Parabolic anomaly.
 
     Returns
     -------
     M : float
         Mean anomaly.
 
-    """
-    M = _kepler_equation_parabolic(D, 0.0, ecc)
-    return M
+    Notes
+    -----
+    We use this definition:
 
+    .. math::
 
-@jit
-def M_to_nu(M, ecc, delta=1e-2):
-    """True anomaly from mean anomaly.
+        M = B + \frac{B^3}{3}
 
-    .. versionadded:: 0.4.0
-
-    Parameters
-    ----------
-    M : float
-        Mean anomaly in radians.
-    ecc : float
-        Eccentricity.
-    delta : float (optional)
-        threshold of near-parabolic regime definition (from Davide Farnocchia et al)
-
-    Returns
-    -------
-    nu : float
-        True anomaly.
-
-    Examples
-    --------
-    >>> from numpy import radians, degrees
-    >>> degrees(M_to_nu(radians(30.0), 0.06))
-    33.67328493021166
+    Notice that M < ν until ν ~ 100 degrees,
+    then it reaches π when ν ~ 120 degrees,
+    and grows without bounds after that.
+    Therefore, it can hardly be called an "anomaly"
+    since it is by no means an angle.
 
     """
-    if ecc > 1 + delta:
-        F = M_to_F(M, ecc)
-        nu = F_to_nu(F, ecc)
-    elif ecc < 1 - delta:
-        E = M_to_E(M, ecc)
-        nu = E_to_nu(E, ecc)
-    else:
-        D = M_to_D(M, ecc)
-        nu = D_to_nu(D)
-    return nu
-
-
-@jit
-def nu_to_M(nu, ecc, delta=1e-2):
-    """Mean anomaly from true anomaly.
-
-    .. versionadded:: 0.4.0
-
-    Parameters
-    ----------
-    nu : float
-        True anomaly in radians.
-    ecc : float
-        Eccentricity.
-    delta : float (optional)
-        threshold of near-parabolic regime definition (from Davide Farnocchia et al)
-
-    Returns
-    -------
-    M : float
-        Mean anomaly.
-
-    """
-    if ecc > 1 + delta:
-        F = nu_to_F(nu, ecc)
-        M = F_to_M(F, ecc)
-    elif ecc < 1 - delta:
-        E = nu_to_E(nu, ecc)
-        M = E_to_M(E, ecc)
-    else:
-        D = nu_to_D(nu)
-        M = D_to_M(D, ecc)
+    M = D + D ** 3 / 3
     return M
 
 
 @jit
 def fp_angle(nu, ecc):
     r"""Returns the flight path angle.
-
-    .. math::
-        \gamma = \arctan{\frac{e\sin{\theta}}{1 + e\cos{\theta}}}
 
     Parameters
     ----------
@@ -472,12 +454,17 @@ def fp_angle(nu, ecc):
         Eccentricity.
 
     Returns
+    -------
     fp_angle: float
         Flight path angle
 
-    Note
+    Notes
     -----
-    Algorithm taken from Vallado 2007, pp. 113.
+    From [3]_, pp. 113:
+
+    .. math::
+
+        \phi = \arctan(\frac {e \sin{\nu}}{1 + e \cos{\nu}})
 
     """
     return np.arctan2(ecc * np.sin(nu), 1 + ecc * np.cos(nu))

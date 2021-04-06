@@ -1,11 +1,12 @@
+import erfa
 import numpy as np
-from astropy import _erfa as erfa, units as u
+from astropy import units as u
 from astropy.coordinates import (
     BaseEclipticFrame,
     CartesianRepresentation,
     DynamicMatrixTransform,
-    GeocentricMeanEcliptic,
-    HeliocentricEclipticIAU76 as HeliocentricEclipticJ2000,
+    GeocentricMeanEcliptic as _GeocentricMeanEcliptic,
+    HeliocentricEclipticIAU76 as _HeliocentricEclipticJ2000,
     TimeAttribute,
     UnitSphericalRepresentation,
     frame_transform_graph,
@@ -25,6 +26,10 @@ __all__ = [
     "GeocentricMeanEcliptic",
     "HeliocentricEclipticJ2000",
 ]
+
+# HACK: sphinx-autoapi variable definition
+GeocentricMeanEcliptic = _GeocentricMeanEcliptic
+HeliocentricEclipticJ2000 = _HeliocentricEclipticJ2000
 
 
 class GeocentricSolarEcliptic(BaseEclipticFrame):
@@ -95,7 +100,7 @@ def _make_rotation_matrix_from_reprs(start_representation, end_representation):
     rotation_axis = A.cross(B)
     rotation_angle = -np.arccos(
         A.dot(B) / (A.norm() * B.norm())
-    )  # negation is required
+    )  # Negation is required
 
     # This line works around some input/output quirks of Astropy's rotation_matrix()
     matrix = np.array(rotation_matrix(rotation_angle, rotation_axis.xyz.value.tolist()))

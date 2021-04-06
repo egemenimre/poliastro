@@ -4,9 +4,9 @@ different propagators available at poliastro:
 +-------------+------------+-----------------+-----------------+
 |  Propagator | Elliptical |    Parabolic    |    Hyperbolic   |
 +-------------+------------+-----------------+-----------------+
-| mean_motion |      ✓     |        ✓        |        ✓        |
+|  farnocchia |      ✓     |        ✓        |        ✓        |
 +-------------+------------+-----------------+-----------------+
-|    kepler   |      ✓     |        ✓        |        ✓        |
+|   vallado   |      ✓     |        ✓        |        ✓        |
 +-------------+------------+-----------------+-----------------+
 |   mikkola   |      ✓     | NOT IMPLEMENTED |        ✓        |
 +-------------+------------+-----------------+-----------------+
@@ -22,26 +22,24 @@ different propagators available at poliastro:
 +-------------+------------+-----------------+-----------------+
 
 """
-import functools
-
 import numpy as np
-from astropy import time, units as u
+from astropy import units as u
 from astropy.coordinates import CartesianDifferential, CartesianRepresentation
 from scipy.integrate import DOP853, solve_ivp
 
 from poliastro.core.propagation import (
     danby as danby_fast,
+    farnocchia as farnocchia_fast,
     func_twobody,
     gooding as gooding_fast,
-    kepler as kepler_fast,
     markley as markley_fast,
-    mean_motion as mean_motion_fast,
     mikkola as mikkola_fast,
     pimienta as pimienta_fast,
+    vallado as vallado_fast,
 )
 
 
-def cowell(k, r, v, tofs, rtol=1e-11, *, ad=None, **ad_kwargs):
+def cowell(k, r, v, tofs, rtol=1e-11, *, events=None, f=func_twobody):
     """Propagates orbit using Cowell's formulation.
 
     Parameters
@@ -56,8 +54,11 @@ def cowell(k, r, v, tofs, rtol=1e-11, *, ad=None, **ad_kwargs):
         Array of times to propagate.
     rtol : float, optional
         Maximum relative error permitted, default to 1e-10.
-    ad : function(t0, u, k), optional
-         Non Keplerian acceleration (km/s2), default to None.
+    events : function(t, u(t)), optional
+        passed to solve_ivp: integration stops when this function
+        returns <= 0., assuming you set events.terminal=True
+    f : function(t0, u, k), optional
+        Objective function, default to Keplerian-only forces.
 
     Returns
     -------
@@ -86,38 +87,39 @@ def cowell(k, r, v, tofs, rtol=1e-11, *, ad=None, **ad_kwargs):
 
     u0 = np.array([x, y, z, vx, vy, vz])
 
-    # Set the non Keplerian acceleration
-    if ad is None:
-
-        def ad(t0, u_, k_):
-            return 0, 0, 0
-
-    f_with_ad = functools.partial(func_twobody, k=k, ad=ad, ad_kwargs=ad_kwargs)
-
     result = solve_ivp(
-        f_with_ad,
+        f,
         (0, max(tofs)),
         u0,
+        args=(k,),
         rtol=rtol,
         atol=1e-12,
         method=DOP853,
         dense_output=True,
+        events=events,
     )
     if not result.success:
         raise RuntimeError("Integration failed")
 
+    t_end = (
+        min(result.t_events[0]) if result.t_events and len(result.t_events[0]) else None
+    )
+
     rrs = []
     vvs = []
     for i in range(len(tofs)):
-        y = result.sol(tofs[i])
+        t = tofs[i]
+        if t_end is not None and t > t_end:
+            t = t_end
+        y = result.sol(t)
         rrs.append(y[:3])
         vvs.append(y[3:])
 
     return rrs * u.km, vvs * u.km / u.s
 
 
-def mean_motion(k, r, v, tofs, **kwargs):
-    """Propagates orbit using Cowell's formulation.
+def farnocchia(k, r, v, tofs, **kwargs):
+    """Propagates orbit.
 
     Parameters
     ----------
@@ -143,7 +145,7 @@ def mean_motion(k, r, v, tofs, **kwargs):
     v0 = v.to(u.km / u.s).value
     tofs = tofs.to(u.s).value
 
-    results = [mean_motion_fast(k, r0, v0, tof) for tof in tofs]
+    results = [farnocchia_fast(k, r0, v0, tof) for tof in tofs]
     # TODO: Rewrite to avoid iterating twice
     return (
         [result[0] for result in results] * u.km,
@@ -151,7 +153,7 @@ def mean_motion(k, r, v, tofs, **kwargs):
     )
 
 
-def kepler(k, r, v, tofs, numiter=350, **kwargs):
+def vallado(k, r, v, tofs, numiter=350, **kwargs):
     """Propagates Keplerian orbit.
 
     Parameters
@@ -202,7 +204,7 @@ def kepler(k, r, v, tofs, numiter=350, **kwargs):
 
 def _kepler(k, r0, v0, tof, *, numiter):
     # Compute Lagrange coefficients
-    f, g, fdot, gdot = kepler_fast(k, r0, v0, tof, numiter)
+    f, g, fdot, gdot = vallado_fast(k, r0, v0, tof, numiter)
 
     assert np.abs(f * gdot - fdot * g - 1) < 1e-5  # Fixed tolerance
 
@@ -214,7 +216,7 @@ def _kepler(k, r0, v0, tof, *, numiter):
 
 
 def mikkola(k, r, v, tofs, rtol=None):
-    """ Solves Kepler Equation by a cubic approximation. This method is valid
+    """Solves Kepler Equation by a cubic approximation. This method is valid
     no mater the orbit's nature.
 
     Parameters
@@ -255,7 +257,7 @@ def mikkola(k, r, v, tofs, rtol=None):
 
 
 def markley(k, r, v, tofs, rtol=None):
-    """ Elliptical Kepler Equation solver based on a fifth-order
+    """Elliptical Kepler Equation solver based on a fifth-order
     refinement of the solution of a cubic equation.
 
     Parameters
@@ -297,7 +299,7 @@ def markley(k, r, v, tofs, rtol=None):
 
 
 def pimienta(k, r, v, tofs, rtol=None):
-    """ Kepler solver for both elliptic and parabolic orbits based on a 15th
+    """Kepler solver for both elliptic and parabolic orbits based on a 15th
     order polynomial with accuracies around 10e-5 for elliptic case and 10e-13
     in the hyperbolic regime.
 
@@ -341,7 +343,7 @@ def pimienta(k, r, v, tofs, rtol=None):
 
 
 def gooding(k, r, v, tofs, numiter=150, rtol=1e-8):
-    """ Solves the Elliptic Kepler Equation with a cubic convergence and
+    """Solves the Elliptic Kepler Equation with a cubic convergence and
     accuracy better than 10e-12 rad is normally achieved. It is not valid for
     eccentricities equal or greater than 1.0.
 
@@ -384,7 +386,7 @@ def gooding(k, r, v, tofs, numiter=150, rtol=1e-8):
 
 
 def danby(k, r, v, tofs, rtol=1e-8):
-    """ Kepler solver for both elliptic and parabolic orbits based on Danby's
+    """Kepler solver for both elliptic and parabolic orbits based on Danby's
     algorithm.
 
     Parameters
@@ -425,7 +427,7 @@ def danby(k, r, v, tofs, rtol=1e-8):
     )
 
 
-def propagate(orbit, time_of_flight, *, method=mean_motion, rtol=1e-10, **kwargs):
+def propagate(orbit, time_of_flight, *, method=farnocchia, rtol=1e-10, **kwargs):
     """Propagate an orbit some time and return the result.
 
     Parameters
@@ -435,7 +437,7 @@ def propagate(orbit, time_of_flight, *, method=mean_motion, rtol=1e-10, **kwargs
     time_of_flight : ~astropy.time.TimeDelta
         Time of propagation.
     method : callable, optional
-        Propagation method, default to mean_motion.
+        Propagation method, default to farnocchia.
     rtol : float, optional
         Relative tolerance, default to 1e-10.
 
@@ -462,14 +464,13 @@ def propagate(orbit, time_of_flight, *, method=mean_motion, rtol=1e-10, **kwargs
     else:
         pass
 
-    # Use the highest precision we can afford
-    # np.atleast_1d does not work directly on TimeDelta objects
-    jd1 = np.atleast_1d(time_of_flight.jd1)
-    jd2 = np.atleast_1d(time_of_flight.jd2)
-    time_of_flight = time.TimeDelta(jd1, jd2, format="jd", scale=time_of_flight.scale)
-
     rr, vv = method(
-        orbit.attractor.k, orbit.r, orbit.v, time_of_flight.to(u.s), rtol=rtol, **kwargs
+        orbit.attractor.k,
+        orbit.r,
+        orbit.v,
+        time_of_flight.reshape(-1).to(u.s),
+        rtol=rtol,
+        **kwargs
     )
 
     # TODO: Turn these into unit tests
@@ -484,8 +485,8 @@ def propagate(orbit, time_of_flight, *, method=mean_motion, rtol=1e-10, **kwargs
 
 
 ELLIPTIC_PROPAGATORS = [
-    mean_motion,
-    kepler,
+    farnocchia,
+    vallado,
     mikkola,
     markley,
     pimienta,
@@ -493,12 +494,11 @@ ELLIPTIC_PROPAGATORS = [
     danby,
     cowell,
 ]
-PARABOLIC_PROPAGATORS = [mean_motion, kepler, mikkola, pimienta, gooding, cowell]
+PARABOLIC_PROPAGATORS = [farnocchia, vallado, mikkola, pimienta, gooding, cowell]
 HYPERBOLIC_PROPAGATORS = [
-    mean_motion,
-    kepler,
+    farnocchia,
+    vallado,
     mikkola,
-    kepler,
     pimienta,
     gooding,
     danby,

@@ -1,11 +1,10 @@
 import numpy as np
+from numba import njit as jit
 from numpy import cross, pi
 from numpy.linalg import norm
 
 from poliastro.core.hyper import hyp2f1b
 from poliastro.core.stumpff import c2, c3
-
-from ._jit import jit
 
 
 @jit
@@ -80,13 +79,13 @@ def vallado(k, r0, r, tof, short, numiter, rtol):
     >>> from astropy import units as u
     >>> import numpy as np
     >>> from poliastro.bodies import Earth
-    >>> k = Earth.k.to(u.km**3 / u.s**2)
-    >>> r1 = np.array([5000, 10000, 2100])*u.km #Initial position vector
-    >>> r2 = np.array([-14600, 2500, 7000])*u.km #Final position vector
-    >>> tof = 3600*u.s #Time of fligh
+    >>> k = Earth.k.to(u.km ** 3 / u.s ** 2)
+    >>> r1 = np.array([5000, 10000, 2100]) * u.km # Initial position vector
+    >>> r2 = np.array([-14600, 2500, 7000]) * u.km # Final position vector
+    >>> tof = 3600 * u.s # Time of flight
     >>> v1, v2 = vallado(k.value, r1.value, r2.value, tof.value, short=True, numiter=35, rtol=1e-8)
-    >>> v1 = v1*u.km / u.s
-    >>> v2 = v2*u.km / u.s
+    >>> v1 = v1 * u.km / u.s
+    >>> v2 = v2 * u.km / u.s
     >>> print(v1, v2)
     [-5.99249503  1.92536671  3.24563805] km / s [-3.31245851 -4.19661901 -0.38528906] km / s
 
@@ -163,7 +162,7 @@ def vallado(k, r0, r, tof, short, numiter, rtol):
 
 @jit
 def izzo(k, r1, r2, tof, M, numiter, rtol):
-    """ Aplies izzo algorithm to solve Lambert's problem.
+    """Aplies izzo algorithm to solve Lambert's problem.
 
     Parameters
     ----------
@@ -243,9 +242,7 @@ def izzo(k, r1, r2, tof, M, numiter, rtol):
 
 @jit
 def _reconstruct(x, y, r1, r2, ll, gamma, rho, sigma):
-    """Reconstruct solution velocity vectors.
-
-    """
+    """Reconstruct solution velocity vectors."""
     V_r1 = gamma * ((ll * y - x) - rho * (ll * y + x)) / r1
     V_r2 = -gamma * ((ll * y - x) + rho * (ll * y + x)) / r2
     V_t1 = gamma * sigma * (y + ll * x) / r1
@@ -255,9 +252,7 @@ def _reconstruct(x, y, r1, r2, ll, gamma, rho, sigma):
 
 @jit
 def _find_xy(ll, T, M, numiter, rtol):
-    """Computes all x, y for given number of revolutions.
-
-    """
+    """Computes all x, y for given number of revolutions."""
     # For abs(ll) == 1 the derivative is not continuous
     assert abs(ll) < 1
     assert T > 0  # Mistake on original paper
@@ -287,9 +282,7 @@ def _find_xy(ll, T, M, numiter, rtol):
 
 @jit
 def _compute_y(x, ll):
-    """Computes y.
-
-    """
+    """Computes y."""
     return np.sqrt(1 - ll ** 2 * (1 - x ** 2))
 
 
@@ -316,17 +309,13 @@ def _compute_psi(x, y, ll):
 
 @jit
 def _tof_equation(x, T0, ll, M):
-    """Time of flight equation.
-
-    """
+    """Time of flight equation."""
     return _tof_equation_y(x, _compute_y(x, ll), T0, ll, M)
 
 
 @jit
 def _tof_equation_y(x, y, T0, ll, M):
-    """Time of flight equation with externally computated y.
-
-    """
+    """Time of flight equation with externally computated y."""
     if M == 0 and np.sqrt(0.6) < x < np.sqrt(1.4):
         eta = y - ll * x
         S_1 = (1 - ll - x * eta) * 0.5
@@ -362,9 +351,7 @@ def _tof_equation_p3(x, y, _, dT, ddT, ll):
 
 @jit
 def _compute_T_min(ll, M, numiter, rtol):
-    """Compute minimum T.
-
-    """
+    """Compute minimum T."""
     if ll == 1:
         x_T_min = 0.0
         T_min = _tof_equation(x_T_min, 0.0, ll, M)
@@ -384,9 +371,7 @@ def _compute_T_min(ll, M, numiter, rtol):
 
 @jit
 def _initial_guess(T, ll, M):
-    """Initial guess.
-
-    """
+    """Initial guess."""
     if M == 0:
         # Single revolution
         T_0 = np.arccos(ll) + ll * np.sqrt(1 - ll ** 2) + M * pi  # Equation 19

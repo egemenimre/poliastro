@@ -3,12 +3,22 @@ import pytest
 from astropy import time, units as u
 from astropy.coordinates import CartesianRepresentation
 from astropy.tests.helper import assert_quantity_allclose
+from hypothesis import given, settings, strategies as st
 from numpy.testing import assert_allclose
 from pytest import approx
 
 from poliastro.bodies import Earth, Moon, Sun
 from poliastro.constants import J2000
 from poliastro.core.elements import rv2coe
+from poliastro.core.propagation import (
+    danby_coe,
+    func_twobody,
+    gooding_coe,
+    markley_coe,
+    mikkola_coe,
+    pimienta_coe,
+)
+from poliastro.core.propagation.farnocchia import farnocchia_coe
 from poliastro.examples import iss
 from poliastro.frames import Planes
 from poliastro.twobody import Orbit
@@ -19,21 +29,30 @@ from poliastro.twobody.propagation import (
     PARABOLIC_PROPAGATORS,
     cowell,
     danby,
+    farnocchia,
     gooding,
-    kepler,
     markley,
-    mean_motion,
     mikkola,
     pimienta,
+    vallado,
 )
 from poliastro.util import norm
+
+
+@pytest.fixture(scope="module")
+def halley():
+    return Orbit.from_vectors(
+        Sun,
+        [-9018878.63569932, -94116054.79839276, 22619058.69943215] * u.km,
+        [-49.95092305, -12.94843055, -4.29251577] * u.km / u.s,
+    )
 
 
 @pytest.mark.parametrize("ecc", [0.9, 0.99, 0.999, 0.9999, 0.99999])
 @pytest.mark.parametrize("propagator", ELLIPTIC_PROPAGATORS)
 def test_elliptic_near_parabolic(ecc, propagator):
     # 'kepler fails if really close to parabolic'. Refer to issue #714.
-    if propagator in [kepler] and ecc > 0.99:
+    if propagator in [vallado] and ecc > 0.99:
         pytest.xfail()
 
     _a = 0.0 * u.rad
@@ -102,7 +121,7 @@ def test_propagation(propagator):
 
 
 def test_propagating_to_certain_nu_is_correct():
-    # take an elliptic orbit
+    # Take an elliptic orbit
     a = 1.0 * u.AU
     ecc = 1.0 / 3.0 * u.one
     _a = 0.0 * u.rad
@@ -122,12 +141,21 @@ def test_propagating_to_certain_nu_is_correct():
     assert elliptic_at_perihelion.epoch > elliptic.epoch
     assert elliptic_at_aphelion.epoch > elliptic.epoch
 
-    # test 10 random true anomaly values
-    for _ in range(10):
-        nu = np.random.uniform(low=0.0, high=2 * np.pi)
+    # Test 10 random true anomaly values
+    # TODO: Rework this test
+    for nu in np.random.uniform(low=-np.pi, high=np.pi, size=10):
         elliptic = elliptic.propagate_to_anomaly(nu * u.rad)
         r, _ = elliptic.rv()
         assert_quantity_allclose(norm(r), a * (1.0 - ecc ** 2) / (1 + ecc * np.cos(nu)))
+
+
+def test_propagate_to_anomaly_in_the_past_fails_for_open_orbits():
+    r0 = [Earth.R.to(u.km).value + 300, 0, 0] * u.km
+    v0 = [0, 15, 0] * u.km / u.s
+    orb = Orbit.from_vectors(Earth, r0, v0)
+
+    with pytest.raises(ValueError, match="True anomaly -0.02 rad not reachable"):
+        orb.propagate_to_anomaly(orb.nu - 1 * u.deg)
 
 
 def test_propagate_accepts_timedelta():
@@ -165,7 +193,7 @@ def test_propagation_hyperbolic():
 
 @pytest.mark.parametrize("propagator", PARABOLIC_PROPAGATORS)
 def test_propagation_parabolic(propagator):
-    # example from Howard Curtis (3rd edition), section 3.5, problem 3.15
+    # Example from Howard Curtis (3rd edition), section 3.5, problem 3.15
     # TODO: add parabolic solver in some parabolic propagators, refer to #417
     if propagator in [mikkola, gooding]:
         pytest.skip()
@@ -198,8 +226,8 @@ def test_propagation_zero_time_returns_same_state():
 
     r, v = ss1.rv()
 
-    assert_allclose(r.value, r0.value)
-    assert_allclose(v.value, v0.value)
+    assert_quantity_allclose(r, r0)
+    assert_quantity_allclose(v, v0)
 
 
 def test_propagation_hyperbolic_zero_time_returns_same_state():
@@ -219,8 +247,8 @@ def test_propagation_hyperbolic_zero_time_returns_same_state():
 
     r, v = ss1.rv()
 
-    assert_allclose(r.value, r0.value)
-    assert_allclose(v.value, v0.value)
+    assert_quantity_allclose(r, r0)
+    assert_quantity_allclose(v, v0)
 
 
 def test_apply_zero_maneuver_returns_equal_state():
@@ -247,7 +275,7 @@ def test_cowell_propagation_with_zero_acceleration_equals_kepler():
     expected_r = np.array([-4219.7527, 4363.0292, -3958.7666]) * u.km
     expected_v = np.array([3.689866, -1.916735, -6.112511]) * u.km / u.s
 
-    r, v = cowell(Earth.k, orbit.r, orbit.v, tofs, ad=None)
+    r, v = cowell(Earth.k, orbit.r, orbit.v, tofs)
 
     assert_quantity_allclose(r[0], expected_r, rtol=1e-5)
     assert_quantity_allclose(v[0], expected_v, rtol=1e-4)
@@ -257,15 +285,22 @@ def test_cowell_propagation_circle_to_circle():
     # From [Edelbaum, 1961]
     accel = 1e-7
 
-    def constant_accel(t0, u, k):
-        v = u[3:]
+    def constant_accel(t0, u_, k):
+        v = u_[3:]
         norm_v = (v[0] ** 2 + v[1] ** 2 + v[2] ** 2) ** 0.5
         return accel * v / norm_v
+
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = constant_accel(t0, u_, k)
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+
+        return du_kep + du_ad
 
     ss = Orbit.circular(Earth, 500 * u.km)
     tofs = [20] * ss.period
 
-    r, v = cowell(Earth.k, ss.r, ss.v, tofs, ad=constant_accel)
+    r, v = cowell(Earth.k, ss.r, ss.v, tofs, f=f)
 
     ss_final = Orbit.from_vectors(Earth, r[0], v[0])
 
@@ -318,11 +353,11 @@ def test_propagate_long_times_keeps_geometry(propagator):
     )
 
 
-@pytest.mark.filterwarnings("ignore::astropy._erfa.core.ErfaWarning")
-def test_long_propagations_kepler_agrees_mean_motion():
+@pytest.mark.filterwarnings("ignore::erfa.core.ErfaWarning")
+def test_long_propagations_vallado_agrees_farnocchia():
     tof = 100 * u.year
-    r_mm, v_mm = iss.propagate(tof, method=mean_motion).rv()
-    r_k, v_k = iss.propagate(tof, method=kepler).rv()
+    r_mm, v_mm = iss.propagate(tof, method=farnocchia).rv()
+    r_k, v_k = iss.propagate(tof, method=vallado).rv()
     assert_quantity_allclose(r_mm, r_k)
     assert_quantity_allclose(v_mm, v_k)
 
@@ -330,29 +365,35 @@ def test_long_propagations_kepler_agrees_mean_motion():
     v_halleys = [-49.95092305, -12.94843055, -4.29251577]  # km/s
     halleys = Orbit.from_vectors(Sun, r_halleys * u.km, v_halleys * u.km / u.s)
 
-    r_mm, v_mm = halleys.propagate(tof, method=mean_motion).rv()
-    r_k, v_k = halleys.propagate(tof, method=kepler).rv()
+    r_mm, v_mm = halleys.propagate(tof, method=farnocchia).rv()
+    r_k, v_k = halleys.propagate(tof, method=vallado).rv()
     assert_quantity_allclose(r_mm, r_k)
     assert_quantity_allclose(v_mm, v_k)
 
 
-@pytest.mark.parametrize("method", [mean_motion, kepler])
-def test_long_propagation_preserves_orbit_elements(method):
-    tof = 100 * u.year
-    r_halleys = np.array(
-        [-9018878.63569932, -94116054.79839276, 22619058.69943215]
-    )  # km
-    v_halleys = np.array([-49.95092305, -12.94843055, -4.29251577])  # km/s
-    halleys = Orbit.from_vectors(Sun, r_halleys * u.km, v_halleys * u.km / u.s)
+@st.composite
+def with_units(draw, elements, unit):
+    value = draw(elements)
+    return value * unit
 
-    params_ini = rv2coe(Sun.k.to(u.km ** 3 / u.s ** 2).value, r_halleys, v_halleys)[:-1]
-    r_new, v_new = halleys.propagate(tof, method=method).rv()
-    params_final = rv2coe(
-        Sun.k.to(u.km ** 3 / u.s ** 2).value,
-        r_new.to(u.km).value,
-        v_new.to(u.km / u.s).value,
-    )[:-1]
-    assert_quantity_allclose(params_ini, params_final)
+
+@settings(deadline=None)
+@given(
+    tof=with_units(
+        elements=st.floats(
+            min_value=80, max_value=120, allow_nan=False, allow_infinity=False
+        ),
+        unit=u.year,
+    )
+)
+@pytest.mark.parametrize("method", [farnocchia, vallado])
+def test_long_propagation_preserves_orbit_elements(tof, method, halley):
+    expected_slow_classical = halley.classical()[:-1]
+
+    slow_classical = halley.propagate(tof, method=method).classical()[:-1]
+
+    for element, expected_element in zip(slow_classical, expected_slow_classical):
+        assert_quantity_allclose(element, expected_element)
 
 
 def test_propagation_sets_proper_epoch():
@@ -381,3 +422,28 @@ def test_propagation_custom_body_works():
     # See https://github.com/poliastro/poliastro/issues/649
     orbit = Orbit.circular(Moon, 100 * u.km)
     orbit.propagate(1 * u.h)
+
+
+@pytest.mark.parametrize(
+    "propagator_coe",
+    [danby_coe, markley_coe, pimienta_coe, mikkola_coe, farnocchia_coe, gooding_coe],
+)
+def test_propagate_with_coe(propagator_coe):
+
+    period = iss.period
+    a, ecc, inc, raan, argp, nu = iss.classical()
+    p = a * (1 - ecc ** 2)
+
+    # Delete the units
+    p = p.to_value(u.km)
+    ecc = ecc.value
+    period = period.to_value(u.s)
+    inc = inc.to_value(u.rad)
+    raan = raan.to_value(u.rad)
+    argp = argp.to_value(u.rad)
+    nu = nu.to_value(u.rad)
+    k = iss.attractor.k.to_value(u.km ** 3 / u.s ** 2)
+
+    nu_final = propagator_coe(k, p, ecc, inc, raan, argp, nu, period)
+
+    assert_quantity_allclose(nu_final, nu)

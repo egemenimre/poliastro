@@ -1,4 +1,5 @@
-from astropy import _erfa as erfa, units as u
+import erfa
+from astropy import units as u
 from astropy.coordinates.solar_system import PLAN94_BODY_NAME_TO_PLANET_INDEX
 
 from ..constants import J2000
@@ -11,7 +12,7 @@ def get_mean_elements(body, epoch=J2000):
 
     Parameters
     ----------
-    body : ~poliastro.bodies.SolarSystemBody
+    body : ~poliastro.bodies.SolarSystemPlanet
         Body.
     epoch : astropy.time.Time
         Epoch.

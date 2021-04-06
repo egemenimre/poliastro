@@ -1,52 +1,24 @@
 import numpy as np
 
 
-def ellipsoidal_to_cartesian(a, b, lat, lon):
-    """
-
-    Converts ellipsoidal coordinates (assuming zero elevation)
-    to the cartesian.
-
-    Parameters
-    ----------
-    a: float
-        semi-major axis
-    b: float
-        semi-minor axis
-    lat: float
-        latitude
-    lon: float
-        longtitude
-
-    Returns
-    -------
-    3d Cartesian coordinates in the form (x, y, z)
-    """
-
-    # radius of curvature
-    cr = a / np.sqrt(1 - (1 - (a / b) ** 2) * np.sin(lat) ** 2)
-
-    x = cr * np.cos(lat) * np.cos(lon)
-    y = cr * np.cos(lat) * np.sin(lon)
-    z = (a / b) ** 2 * cr * np.sin(lat)
-    return x, y, z
-
-
 def intersection_ellipsoid_line(x, y, z, u1, u2, u3, a, b, c):
     """
     Intersection of an ellipsoid defined by its axises a, b, c with the
-    line p + λu
+    line p + λu.
+
     Parameters
     ----------
-    x, y, z: float
+    float x, y, z
         a point of the line
-    u1, u2, u3: float
+    float u1, u2, u3
         the line vector
-    a, b, c: float
+    float a, b, c
         the ellipsoidal axises
+
     Returns
     -------
-    This returns both of the points intersecting the ellipsoid.
+    p0, p1: list
+        This returns both of the points intersecting the ellipsoid.
     """
     # Get rid of one parameter by translating the line's direction vector
     k, m = u2 / u1, u3 / u1
@@ -109,9 +81,11 @@ def project_point_on_ellipsoid(x, y, z, a, b, c):
 
     Parameters
     ----------
-    x, y, z: Cartesian coordinates of point
+    float x, y, z
+        Cartesian coordinates of point
 
-    a, b, c: semi-axises of the ellipsoid
+    float a, b, c
+        semi-axises of the ellipsoid
     """
     p1, p2 = intersection_ellipsoid_line(x, y, z, x, y, z, a, b, c)
 

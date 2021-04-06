@@ -18,9 +18,10 @@ from czml3.properties import (
     SolidColorMaterial,
 )
 from czml3.types import IntervalValue, TimeInterval
+from erfa import gd2gce
 
 from poliastro.bodies import Earth
-from poliastro.czml.utils import ellipsoidal_to_cartesian, project_point_on_ellipsoid
+from poliastro.czml.utils import project_point_on_ellipsoid
 from poliastro.twobody.propagation import propagate
 
 PIC_SATELLITE = (
@@ -48,8 +49,7 @@ class CZMLExtractor:
     def __init__(
         self, start_epoch, end_epoch, N, attractor=None, pr_map=None, scene3D=True
     ):
-        """
-        Orbital constructor
+        """Orbital constructor
 
         Parameters
         ----------
@@ -58,19 +58,17 @@ class CZMLExtractor:
         end_epoch: ~astropy.time.core.Time
             Ending epoch
         N: int
-            Default number of sample points.
-            Unless otherwise specified, the number
-            of sampled data points will be N when calling
-            add_orbit()
+            Default number of sample points. Unless otherwise specified, the
+            number of sampled data points will be N when calling add_orbit()
         attractor: poliastro.Body
             Attractor of the orbits
         scene3D: bool
-            Determines the scene mode. If set to true, the scene
-            is set to 3D mode, otherwise it's the orthographic
-            projection.
+            Determines the scene mode. If set to true, the scene is set to 3D
+            mode, otherwise it's the orthographic projection.
+
         """
         self.packets = []  # type: List[Packet]
-
+        self.trajectories = []  # type: List[Any]
         self.attractor = attractor
         self.orbits = []  # type: List[Any]
         self.N = N
@@ -129,7 +127,7 @@ class CZMLExtractor:
             cords = position.represent_as(CartesianRepresentation).xyz.to(u.meter).value
             cords = np.insert(cords, 0, h.value * k, axis=0)
 
-            # flatten list
+            # Flatten list
             cart_cords += list(map(lambda x: round(x[0], rf), cords.tolist()))
 
         return cart_cords
@@ -166,7 +164,7 @@ class CZMLExtractor:
             cords = position.represent_as(CartesianRepresentation).xyz.to(u.meter).value
             cords = np.insert(cords, 0, h.value * k, axis=0)
 
-            # flatten list
+            # Flatten list
             cords = list(map(lambda x: round(x[0], rf), cords.tolist()))
             t, p = cords[0], cords[1:]
             pr_p = project_point_on_ellipsoid(
@@ -184,8 +182,7 @@ class CZMLExtractor:
 
     def _init_czml_(self):
         """
-        Only called at the initialization of the extractor
-        Builds packets.
+        Only called at the initialization of the extractor Builds packets.
         """
         pckt = Preamble(
             name="document_packet",
@@ -203,6 +200,7 @@ class CZMLExtractor:
     def _change_custom_params(self, ellipsoid, pr_map, scene3D):
         """
         Change the custom properties package.
+
         Parameters
         ----------
         ellipsoid: list(int)
@@ -210,6 +208,7 @@ class CZMLExtractor:
             representing the radii in the x, y and z axis
         pr_map: str
             A URL to the projection of the defined ellipsoid (UV map)
+
         """
 
         if pr_map is None:
@@ -244,21 +243,11 @@ class CZMLExtractor:
 
         Parameters
         ----------
-        orbit: poliastro.Orbit
-            Orbit to be added
         pos: list [~astropy.units]
-            coordinates of ground station
-            [u v] ellipsoidal coordinates (0 elevation)
-
-        Id parameters:
-        -------------
-
+            coordinates of ground station,
+            list of geodetic latitude and longitude [lon, lat] (0 elevation)
         id_description: str
             Set ground station description
-
-        Label parameters
-        ----------
-
         label_fill_color: list (int)
             Fill Color in rgba format
         label_outline_color: list (int)
@@ -281,10 +270,14 @@ class CZMLExtractor:
                 a, b = (
                     self.cust_prop[0][0],
                     self.cust_prop[0][2],
-                )  # get semi-major and semi-minor axises
+                )  # Get semi-major and semi-minor axises
             else:
-                a, b = Earth.R.to(u.m).value, Earth.R_polar.to(u.m).value
-            pos = list(map(lambda x: x.value, ellipsoidal_to_cartesian(a, b, u0, v0)))
+                a, b = Earth.R.to_value(u.m), Earth.R_polar.to_value(u.m)
+
+            f = 1 - (b / a)  # Flattenning
+
+            pos = list(gd2gce(a, f, u0.to_value(u.rad), v0.to_value(u.rad), 0))
+
         else:
             raise TypeError(
                 "Invalid coordinates. Coordinates must be of the form [u, v] where u, v are astropy units"
@@ -344,10 +337,6 @@ class CZMLExtractor:
             Maximum relative error permitted
         N: int
             Number of sample points
-
-        Groundtrack parameters:
-        -----------------------
-
         groundtrack_show: bool
             If set to true, the groundtrack is
             displayed.
@@ -359,28 +348,16 @@ class CZMLExtractor:
             Groundtrack width
         groundtrack_color: list (int)
             Rgba groundtrack color. By default, it is set to the path color
-
-        Id parameters:
-        --------------
-
         id_name: str
             Set orbit name
         id_description: str
             Set orbit description
-
-        Path parameters
-        ---------------
-
         path_width: int
             Path width
         path_show: bool
             Indicates whether the path is visible
         path_color: list (int)
             Rgba path color
-
-        Label parameters
-        ----------
-
         label_fill_color: list (int)
             Fill Color in rgba format
         label_outline_color: list (int)
@@ -391,7 +368,6 @@ class CZMLExtractor:
             Set label text
         label_show: bool
             Indicates whether the label is visible
-
         """
 
         if N is None:
@@ -494,5 +470,142 @@ class CZMLExtractor:
 
         self.i += 1
 
+    def add_trajectory(
+        self,
+        positions,
+        epochs,
+        groundtrack_show=False,
+        groundtrack_lead_time=None,
+        groundtrack_trail_time=None,
+        groundtrack_width=None,
+        groundtrack_color=None,
+        id_name=None,
+        id_description=None,
+        path_width=None,
+        path_show=None,
+        path_color=None,
+        label_fill_color=None,
+        label_outline_color=None,
+        label_font=None,
+        label_text=None,
+        label_show=None,
+    ):
+        """
+        Adds trajectory.
+
+        Parameters
+        ----------
+        positions: ~astropy.coordinates.CartesianRepresentation
+            Trajectory to plot.
+        epochs: ~astropy.time.core.Time
+            Epochs for positions.
+        groundtrack_show: bool
+            If set to true, the groundtrack is
+            displayed.
+        groundtrack_lead_time: double
+            The time the animation is ahead of the real-time groundtrack
+        groundtrack_trail_time: double
+            The time the animation is behind the real-time groundtrack
+        groundtrack_width: int
+            Groundtrack width
+        groundtrack_color: list (int)
+            Rgba groundtrack color. By default, it is set to the path color
+        id_name: str
+            Set orbit name
+        id_description: str
+            Set orbit description
+        path_width: int
+            Path width
+        path_show: bool
+            Indicates whether the path is visible
+        path_color: list (int)
+            Rgba path color
+        label_fill_color: list (int)
+            Fill Color in rgba format
+        label_outline_color: list (int)
+            Outline Color in rgba format
+        label_font: str
+            Set label font style and size (CSS syntax)
+        label_text: str
+            Set label text
+        label_show: bool
+            Indicates whether the label is visible
+
+        """
+
+        if self.attractor is None:
+            raise ValueError("An attractor must be set up first.")
+
+        positions = (
+            positions.represent_as(CartesianRepresentation).get_xyz(1).to(u.meter).value
+        )
+
+        epochs = Time(epochs, format="isot")
+
+        if len(epochs) != len(positions):
+            raise ValueError("Number of Points and Epochs must be equal.")
+
+        epochs = np.fromiter(
+            map(lambda epoch: (epoch - epochs[0]).to(u.second).value, epochs),
+            dtype=float,
+        )
+
+        positions = np.around(
+            np.concatenate([epochs[..., None], positions], axis=1).ravel(), 1
+        ).tolist()
+
+        self.trajectories.append([positions, None, label_text, path_color])
+
+        start_epoch = Time(self.start_epoch, format="isot")
+
+        pckt = Packet(
+            id=self.i,
+            name=id_name,
+            description=id_description,
+            availability=TimeInterval(start=self.start_epoch, end=self.end_epoch),
+            position=Position(
+                interpolationDegree=5,
+                interpolationAlgorithm=InterpolationAlgorithms.LAGRANGE,
+                referenceFrame=ReferenceFrames.INERTIAL,
+                cartesian=positions,
+                # Use explicit UTC timezone, rather than the default, which is a local timezone.
+                epoch=start_epoch.datetime.replace(tzinfo=timezone.utc),
+            ),
+            path=Path(
+                show=path_show,
+                width=path_width,
+                material=Material(
+                    solidColor=SolidColorMaterial(color=Color.from_list(path_color))
+                )
+                if path_color is not None
+                else Material(
+                    solidColor=SolidColorMaterial(color=Color.from_list([255, 255, 0]))
+                ),
+                resolution=120,
+            ),
+            label=Label(
+                text=label_text,
+                font=label_font if label_font is not None else "11pt Lucida Console",
+                show=label_show,
+                fillColor=Color(rgba=label_fill_color)
+                if label_fill_color is not None
+                else Color(rgba=[255, 255, 0, 255]),
+                outlineColor=Color(rgba=label_outline_color)
+                if label_outline_color is not None
+                else Color(rgba=[255, 255, 0, 255]),
+            ),
+            billboard=Billboard(image=PIC_SATELLITE, show=True),
+        )
+
+        self.packets.append(pckt)
+
+        if groundtrack_show:
+            raise NotImplementedError(
+                "Ground tracking for trajectory not implemented yet"
+            )
+
+        self.i += 1
+
     def get_document(self):
+        """Retrieves CZML document."""
         return Document(self.packets)

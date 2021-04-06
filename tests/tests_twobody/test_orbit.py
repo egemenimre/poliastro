@@ -1,4 +1,7 @@
 import pickle
+from collections import OrderedDict
+from functools import partial
+from unittest import mock
 
 import matplotlib
 import numpy as np
@@ -12,6 +15,7 @@ from astropy.coordinates import (
 )
 from astropy.tests.helper import assert_quantity_allclose
 from astropy.time import Time
+from hypothesis import example, given, settings, strategies as st
 from numpy.testing import assert_allclose, assert_array_equal
 
 from poliastro.bodies import (
@@ -22,20 +26,19 @@ from poliastro.bodies import (
     Mercury,
     Moon,
     Neptune,
-    Pluto,
     Saturn,
     Sun,
     Uranus,
     Venus,
 )
 from poliastro.constants import J2000, J2000_TDB
+from poliastro.ephem import Ephem
 from poliastro.examples import iss
 from poliastro.frames.ecliptic import HeliocentricEclipticJ2000
 from poliastro.frames.enums import Planes
 from poliastro.frames.equatorial import (
     GCRS,
     HCRS,
-    ICRS,
     JupiterICRS,
     MarsICRS,
     MercuryICRS,
@@ -45,12 +48,9 @@ from poliastro.frames.equatorial import (
     VenusICRS,
 )
 from poliastro.frames.util import get_frame
+from poliastro.twobody.angles import E_to_M, nu_to_E
 from poliastro.twobody.orbit import Orbit
-from poliastro.warnings import (
-    OrbitSamplingWarning,
-    PatchedConicsWarning,
-    TimeScaleWarning,
-)
+from poliastro.warnings import OrbitSamplingWarning, PatchedConicsWarning
 
 
 @pytest.fixture()
@@ -63,6 +63,14 @@ def hyperbolic():
     )
     epoch = Time("2015-07-14 07:59", scale="tdb")
     return Orbit.from_vectors(Sun, r, v, epoch)
+
+
+@pytest.fixture()
+def near_parabolic():
+    r = [8.0e3, 1.0e3, 0.0] * u.km
+    v = [-0.5, -0.5, 0.0] * u.km / u.s
+
+    return Orbit.from_vectors(Earth, r, v)
 
 
 def test_default_time_for_new_state():
@@ -86,6 +94,15 @@ def test_state_raises_unitserror_if_elements_units_are_wrong():
         "UnitsError: Argument 'nu' to function 'from_classical' must be in units convertible to 'rad'."
         in excinfo.exconly()
     )
+
+
+def test_orbit_from_classical_wraps_out_of_range_anomaly_and_warns():
+    _d = 1.0 * u.AU  # Unused distance
+    _ = 0.5 * u.one  # Unused dimensionless value
+    _a = 1.0 * u.deg  # Unused angle
+    out_angle = np.pi * u.rad
+    with pytest.warns(UserWarning, match="Wrapping true anomaly to -π <= nu < π"):
+        Orbit.from_classical(Sun, _d, _, _a, _a, _a, out_angle)
 
 
 def test_state_raises_unitserror_if_rv_units_are_wrong():
@@ -145,31 +162,6 @@ def test_apply_maneuver_changes_epoch():
     dv = [0, 0, 0] * u.km / u.s
     orbit_new = ss.apply_maneuver([(dt, dv)])
     assert orbit_new.epoch == ss.epoch + dt
-
-
-def test_orbit_from_ephem_with_no_epoch_is_today():
-    # This is not that obvious http://stackoverflow.com/q/6407362/554319
-    body = Earth
-    ss = Orbit.from_body_ephem(body)
-    assert (Time.now() - ss.epoch).sec < 1
-
-
-def test_from_ephem_raises_warning_if_time_is_not_tdb_with_proper_time(recwarn):
-    body = Earth
-    epoch = Time("2017-09-29 07:31:26", scale="utc")
-    expected_epoch_string = "2017-09-29 07:32:35.182"  # epoch.tdb.value
-
-    Orbit.from_body_ephem(body, epoch)
-
-    w = recwarn.pop(TimeScaleWarning)
-    assert expected_epoch_string in str(w.message)
-
-
-@pytest.mark.parametrize("body", [Moon, Pluto])
-def test_from_ephem_raises_error_for_pluto_moon(body):
-    with pytest.raises(RuntimeError) as excinfo:
-        Orbit.from_body_ephem(body)
-    assert "To compute the position and velocity" in excinfo.exconly()
 
 
 def test_circular_has_proper_semimajor_axis():
@@ -285,7 +277,7 @@ def test_frozen_orbit_no_args(attractor, alt, expected_inc, expected_argp):
         (
             Earth,
             1e6 * u.m,
-            2 * u.deg,  # Non critical value
+            2 * u.deg,  # Non-critical value
             63.4349 * np.pi / 180 * u.rad,
             None,
             0.0549 * u.one,
@@ -293,7 +285,7 @@ def test_frozen_orbit_no_args(attractor, alt, expected_inc, expected_argp):
         (
             Mars,
             3e8 * u.m,
-            0 * u.deg,  # Non critical value
+            0 * u.deg,  # Non-critical value
             63.4349 * np.pi / 180 * u.rad,
             0.04 * u.one,
             0.04 * u.one,
@@ -526,15 +518,6 @@ def test_orbit_from_custom_body_raises_error_when_asked_frame():
     )
 
 
-@pytest.mark.parametrize(
-    "body", [Sun, Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune]
-)
-def test_orbit_from_ephem_is_in_icrs_frame(body):
-    ss = Orbit.from_body_ephem(body)
-
-    assert ss.get_frame().is_equivalent_frame(ICRS())
-
-
 def test_orbit_accepts_ecliptic_plane():
     r = [1e09, -4e09, -1e09] * u.km
     v = [5e00, -1e01, -4e00] * u.km / u.s
@@ -605,8 +588,8 @@ def test_orbit_from_horizons_has_expected_elements():
     )
     ss1 = Orbit.from_horizons(name="Ceres", attractor=Sun, epoch=epoch)
     assert ss.pqw()[0].value.all() == ss1.pqw()[0].value.all()
-    assert ss.r_a == ss1.r_a
-    assert ss.a == ss1.a
+    assert_quantity_allclose(ss.r_a, ss1.r_a, rtol=1.0e-4)
+    assert_quantity_allclose(ss.a, ss1.a, rtol=1.0e-4)
 
 
 @pytest.mark.remote_data
@@ -617,82 +600,143 @@ def test_plane_is_set_in_horizons():
 
 
 @pytest.mark.parametrize(
-    "attractor,angular_velocity,expected_a,expected_period",
+    "attractor,expected_a,expected_period",
     [
         (
             Earth,
-            (2 * np.pi / 23.9345) * u.rad / u.hour,
-            42_164_205 * u.m,
-            23.9345 * u.hour,
+            Earth.R + 35786 * u.km,
+            Earth.rotational_period,
         ),
         (
             Mars,
-            (2 * np.pi / 24.6228) * u.rad / u.hour,
-            20_427_595 * u.m,
-            24.6228 * u.hour,
+            Mars.R + 17031 * u.km,
+            Mars.rotational_period,
         ),
     ],
 )
-def test_geostationary_creation_from_angular_velocity(
-    attractor, angular_velocity, expected_a, expected_period
-):
-    ss = Orbit.geostationary(attractor=attractor, angular_velocity=angular_velocity)
-    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-7)
-    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-7)
+def test_stationary_orbit(attractor, expected_a, expected_period):
+    ss = Orbit.stationary(attractor=attractor)
+    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-4)
+    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-4)
 
 
 @pytest.mark.parametrize(
-    "attractor,period,expected_a",
+    "attractor,expected_a,expected_period",
     [
-        (Earth, 23.9345 * u.hour, 42_164_205 * u.m),
-        (Mars, 24.6228 * u.hour, 20_427_595 * u.m),
+        (
+            Earth,
+            Earth.R + 35786 * u.km,
+            Earth.rotational_period,
+        ),
+        (
+            Mars,
+            Mars.R + 17031 * u.km,
+            Mars.rotational_period,
+        ),
     ],
 )
-def test_geostationary_creation_from_period(attractor, period, expected_a):
-    ss = Orbit.geostationary(attractor=attractor, period=period)
-    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-7)
-    assert_quantity_allclose(ss.period, period, rtol=1.0e-7)
+def test_synchronous_orbit_without_ecc_and_inclination_given(
+    attractor, expected_a, expected_period
+):
+    ss = Orbit.synchronous(attractor=attractor)
+    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-4)
+    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-4)
 
 
 @pytest.mark.parametrize(
-    "attractor,period,hill_radius,expected_a",
+    "attractor,ecc,expected_a,expected_period",
     [
-        (Earth, 23.9345 * u.hour, 0.01 * u.AU, 42_164_205 * u.m),
-        (Mars, 24.6228 * u.hour, 1_000_000 * u.km, 20_427_595 * u.m),
+        (
+            Mercury,
+            0.0167 * u.one,
+            Mercury.R + 240453 * u.km,
+            Mercury.rotational_period,
+        ),
+        (
+            Jupiter,
+            0.0934 * u.one,
+            Jupiter.R + 88565 * u.km,
+            Jupiter.rotational_period,
+        ),
     ],
 )
-def test_geostationary_creation_with_Hill_radius(
-    attractor, period, hill_radius, expected_a
+def test_synchronous_orbit_without_inclination_given(
+    attractor, ecc, expected_a, expected_period
 ):
-    ss = Orbit.geostationary(
-        attractor=attractor, period=period, hill_radius=hill_radius
-    )
-    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-7)
-    assert_quantity_allclose(ss.period, period, rtol=1.0e-7)
-
-
-@pytest.mark.parametrize("attractor", [Earth, Mars])
-def test_geostationary_input(attractor):
-    with pytest.raises(ValueError) as excinfo:
-        Orbit.geostationary(attractor=attractor)
-
-    assert (
-        "ValueError: At least one among angular_velocity or period must be passed"
-        in excinfo.exconly()
-    )
+    ss = Orbit.synchronous(attractor=attractor, ecc=ecc)
+    assert_quantity_allclose(ss.ecc, ecc, rtol=1.0e-3)
+    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-3)
+    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-3)
 
 
 @pytest.mark.parametrize(
-    "attractor,period,hill_radius", [(Venus, 243.025 * u.day, 1_000_000 * u.km)]
+    "attractor,ecc,expected_a,expected_period",
+    [
+        (
+            Mercury,
+            1 * u.one,
+            Mercury.R + 240453 * u.km,
+            Mercury.rotational_period,
+        )
+    ],
 )
-def test_geostationary_non_existence_condition(attractor, period, hill_radius):
+def test_synchronous_orbit_pericenter_smaller_than_atractor_radius(
+    attractor, ecc, expected_a, expected_period
+):
     with pytest.raises(ValueError) as excinfo:
-        Orbit.geostationary(attractor=attractor, period=period, hill_radius=hill_radius)
+        Orbit.synchronous(attractor=attractor, ecc=ecc)
+    assert excinfo.type == ValueError
+    assert str(excinfo.value) == "The orbit for the given parameters doesn't exist"
 
-    assert (
-        "Geostationary orbit for the given parameters doesn't exist"
-        in excinfo.exconly()
-    )
+
+@pytest.mark.parametrize(
+    "attractor,ecc,expected_a,expected_period",
+    [
+        (
+            Mercury,
+            0.0167 * u.one,
+            2 ** (2 / 3) * (Mercury.R + 240453 * u.km),
+            2 * Mercury.rotational_period,
+        ),
+        (
+            Jupiter,
+            0.0934 * u.one,
+            2 ** (2 / 3) * (Jupiter.R + 88565 * u.km),
+            2 * Jupiter.rotational_period,
+        ),
+    ],
+)
+def test_synchronous_orbit_supersynchronous(
+    attractor, ecc, expected_a, expected_period
+):
+    ss = Orbit.synchronous(attractor=attractor, ecc=ecc, period_mul=2 * u.one)
+    assert_quantity_allclose(ss.ecc, ecc, rtol=1.0e-3)
+    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-3)
+    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-3)
+
+
+@pytest.mark.parametrize(
+    "attractor,ecc,expected_a,expected_period",
+    [
+        (
+            Mercury,
+            0.0167 * u.one,
+            0.5 ** (2 / 3) * (Mercury.R + 240453 * u.km),
+            0.5 * Mercury.rotational_period,
+        ),
+        (
+            Jupiter,
+            0.0934 * u.one,
+            0.5 ** (2 / 3) * (Jupiter.R + 88565 * u.km),
+            0.5 * Jupiter.rotational_period,
+        ),
+    ],
+)
+def test_synchronous_orbit_semisynchronous(attractor, ecc, expected_a, expected_period):
+    ss = Orbit.synchronous(attractor=attractor, ecc=ecc, period_mul=0.5 * u.one)
+    assert_quantity_allclose(ss.ecc, ecc, rtol=1.0e-3)
+    assert_quantity_allclose(ss.a, expected_a, rtol=1.0e-3)
+    assert_quantity_allclose(ss.period, expected_period, rtol=1.0e-3)
 
 
 def test_heliosynchronous_orbit_enough_arguments():
@@ -758,9 +802,9 @@ def test_expected_mean_anomaly():
     nu = 120 * u.deg
 
     orbit = Orbit.from_classical(attractor, a, ecc, _a, _a, _a, nu)
-    orbit_M = orbit.M
+    orbit_M = E_to_M(nu_to_E(orbit.nu, orbit.ecc), orbit.ecc)
 
-    assert_quantity_allclose(orbit_M.value, expected_mean_anomaly.value, rtol=1e-2)
+    assert_quantity_allclose(orbit_M, expected_mean_anomaly, rtol=1e-2)
 
 
 def test_expected_angular_momentum():
@@ -794,7 +838,7 @@ def test_expected_last_perifocal_passage():
     orbit = Orbit.from_classical(attractor, a, ecc, _a, _a, _a, nu)
     orbit_t_p = orbit.t_p
 
-    assert_quantity_allclose(orbit_t_p.value, expected_t_p.value, rtol=1e-2)
+    assert_quantity_allclose(orbit_t_p, expected_t_p, rtol=1e-2)
 
 
 def test_convert_from_rv_to_coe():
@@ -977,20 +1021,48 @@ def test_from_coord_if_coord_is_not_of_shape_zero():
 def test_from_sbdb_and_from_horizons_give_similar_results(target_name):
     ss_target = Orbit.from_sbdb(target_name)
     ss_classical = ss_target.classical()
-
-    ss_ref = Orbit.from_horizons(
-        name=target_name, attractor=Sun, plane=Planes.EARTH_ECLIPTIC
-    )
-
-    ss_ref = ss_ref.propagate_to_anomaly(
-        ss_classical[5]
-    )  # Catch reference orbit to same epoch
-    ss_ref_class = ss_ref.classical()
+    ss_ref_class = Orbit.from_horizons(
+        name=target_name,
+        attractor=Sun,
+        plane=Planes.EARTH_ECLIPTIC,
+        epoch=ss_target.epoch,
+    ).classical()
 
     for test_elm, ref_elm in zip(ss_classical, ss_ref_class):
         assert_quantity_allclose(
-            test_elm, ref_elm, rtol=1e-2
-        )  # Maximum error of 1% (chosen arbitrarily)
+            test_elm, ref_elm, rtol=1e-3
+        )  # Maximum error of 0.1% (chosen arbitrarily)
+
+
+def test_propagate_to_anomaly_gives_expected_result():
+    # From "Going to Jupiter with Python using Jupyter and poliastro.ipynb"
+    ic1 = Orbit.from_vectors(
+        Sun,
+        [1.02465527e08, -1.02313505e08, -4.43533465e07] * u.km,
+        [2198705.82621226, 1897186.74383856, 822370.88977487] * u.km / u.day,
+        Time("2011-08-05 16:26:06.183", scale="tdb"),
+    )
+    ic1_end = ic1.propagate_to_anomaly(180.0 * u.deg)
+
+    assert_quantity_allclose(
+        (ic1_end.epoch - ic1.epoch).to(u.s), ic1.period / 2, rtol=1e-2
+    )
+
+
+def test_sample_with_out_of_range_anomaly_works():
+    # From "Going to Jupiter with Python using Jupyter and poliastro.ipynb"
+    ic1 = Orbit.from_vectors(
+        Sun,
+        [1.02465527e08, -1.02313505e08, -4.43533465e07] * u.km,
+        [2198705.82621226, 1897186.74383856, 822370.88977487] * u.km / u.day,
+        Time("2011-08-05 16:26:06.183", scale="tdb"),
+    )
+    coordinates = ic1.sample(3, max_anomaly=180.0 * u.deg)
+
+    assert_quantity_allclose(coordinates[0].get_xyz(), ic1.r)
+    assert_quantity_allclose(
+        coordinates[-1].get_xyz(), ic1.propagate_to_anomaly(180.0 * u.deg).r
+    )
 
 
 @pytest.mark.remote_data
@@ -1002,6 +1074,19 @@ def test_from_sbdb_raise_valueerror():
         str(excinfo.value)
         == "2 different objects found: \n2688 Halley (1982 HG1)\n1P/Halley\n"
     )
+
+
+def test_from_ephem_has_expected_properties():
+    epoch = J2000_TDB
+    ephem = Ephem.from_body(Earth, epoch, attractor=Sun)
+    expected_r, expected_v = ephem.rv(epoch)
+
+    ss = Orbit.from_ephem(Sun, ephem, epoch)
+
+    assert ss.plane is ephem.plane
+    assert ss.epoch == epoch
+    assert_quantity_allclose(ss.r, expected_r)
+    assert_quantity_allclose(ss.v, expected_v)
 
 
 def test_from_vectors_wrong_dimensions_fails():
@@ -1055,8 +1140,10 @@ def test_orbit_change_attractor_force():
         v=[-13.30694373, 25.15256978, 11.59846936] * u.km / u.s,
         epoch=J2000,
     )
-
-    ss_new_attractor = ss.change_attractor(Earth, force=True)
+    with pytest.warns(
+        PatchedConicsWarning, match="Leaving the SOI of the current attractor"
+    ):
+        ss_new_attractor = ss.change_attractor(Earth, force=True)
     assert ss_new_attractor.attractor == Earth
 
 
@@ -1080,11 +1167,10 @@ def test_orbit_change_attractor_open():
     v = [-15.457, 6.618, 2.533] * u.km / u.s
     ss = Orbit.from_vectors(Earth, r, v)
 
-    with pytest.warns(PatchedConicsWarning) as record:
+    with pytest.warns(
+        PatchedConicsWarning, match="Leaving the SOI of the current attractor"
+    ):
         ss.change_attractor(Sun)
-
-    w = record.pop(PatchedConicsWarning)
-    assert "Leaving the SOI of the current attractor" in w.message.args[0]
 
 
 @pytest.mark.parametrize(
@@ -1109,19 +1195,77 @@ def test_change_plane_twice_restores_original_data():
     assert_quantity_allclose(new_ss.v, iss.v)
 
 
-def test_time_to_anomaly():
-    expected_tof = iss.period / 2
-    iss_180 = iss.propagate_to_anomaly(180 * u.deg)
-    tof = iss_180.time_to_anomaly(0 * u.deg)
+@st.composite
+def with_units(draw, elements, unit):
+    value = draw(elements)
+    return value * unit
 
-    assert_quantity_allclose(tof, expected_tof)
+
+angles = partial(st.floats, min_value=-np.pi, max_value=np.pi, exclude_max=True)
+angles_q = partial(with_units, elements=angles(), unit=u.rad)
+
+
+@settings(deadline=None)
+@given(expected_nu=angles_q())
+@example(1e-13 * u.rad)
+def test_time_to_anomaly(expected_nu):
+    tof = iss.time_to_anomaly(expected_nu)
+    iss_propagated = iss.propagate(tof)
+
+    assert_quantity_allclose(iss_propagated.nu, expected_nu, atol=1e-12 * u.rad)
 
 
 @pytest.mark.xfail
-def test_issue_798():
+def test_can_set_iss_attractor_to_earth():
+    # See https://github.com/poliastro/poliastro/issues/798
     epoch = Time("2019-11-10 12:00:00")
-    iss = Orbit.from_horizons(
-        "International Space Station", Sun, epoch=epoch, id_type="majorbody"
+    ephem = Ephem.from_horizons(
+        "International Space Station", epochs=epoch, attractor=Sun, id_type="majorbody"
     )
+    iss = Orbit.from_ephem(Sun, ephem, epoch)
     iss = iss.change_attractor(Earth)
     assert iss.attractor == Earth
+
+
+@mock.patch("astroquery.jplsbdb.SBDB.query")
+def test_issue_916(mock_query):
+    name = "67/P"
+    mock_query.return_value = OrderedDict(
+        [
+            ("moreInfo", "https://ssd-api.jpl.nasa.gov/doc/sbdb.html"),
+            ("message", "specified object was not found"),
+            ("code", "200"),
+        ]
+    )
+    with pytest.raises(ValueError) as excinfo:
+        Orbit.from_sbdb(name)
+    assert "ValueError: Object {} not found".format(name) in excinfo.exconly()
+
+
+def test_near_parabolic_M_does_not_hang(near_parabolic):
+    # See https://github.com/poliastro/poliastro/issues/907
+    expected_nu = -168.65 * u.deg
+    orb = near_parabolic.propagate_to_anomaly(expected_nu)
+
+    assert_quantity_allclose(orb.nu, expected_nu)
+
+
+def test_propagation_near_parabolic_orbits_zero_seconds_gives_same_anomaly(
+    near_parabolic,
+):
+    orb_final = near_parabolic.propagate(0 * u.s)
+
+    # Smoke test
+    assert_quantity_allclose(orb_final.nu, near_parabolic.nu)
+    assert orb_final.epoch == near_parabolic.epoch
+
+
+def test_propagation_near_parabolic_orbits_does_not_hang(near_parabolic):
+    # See https://github.com/poliastro/poliastro/issues/475
+    orb_final = near_parabolic.propagate(near_parabolic.period)
+
+    # Smoke test
+    assert_quantity_allclose(orb_final.nu, near_parabolic.nu)
+    assert_quantity_allclose(
+        (orb_final.epoch - near_parabolic.epoch).to(u.s), near_parabolic.period
+    )

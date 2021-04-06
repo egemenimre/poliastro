@@ -16,15 +16,16 @@ from astroquery.jplhorizons import Horizons
 from astroquery.jplsbdb import SBDB
 
 from poliastro.constants import J2000
-from poliastro.core.angles import nu_to_M as nu_to_M_fast
 from poliastro.frames import Planes
 from poliastro.frames.util import get_frame
 from poliastro.threebody.soi import laplace_radius
-from poliastro.twobody.angles import E_to_nu, M_to_nu, nu_to_M, raan_from_ltan
-from poliastro.twobody.propagation import mean_motion, propagate
+from poliastro.twobody.propagation import farnocchia, propagate
 
+from ..core.elements import coe2rv_many
+from ..core.propagation.farnocchia import delta_t_from_nu as delta_t_from_nu_fast
 from ..util import find_closest_value, norm
 from ..warnings import OrbitSamplingWarning, PatchedConicsWarning, TimeScaleWarning
+from .angles import D_to_nu, E_to_nu, F_to_nu, M_to_D, M_to_E, M_to_F, raan_from_ltan
 from .elements import (
     get_eccentricity_critical_argp,
     get_eccentricity_critical_inc,
@@ -32,6 +33,7 @@ from .elements import (
     hyp_nu_limit,
 )
 from .mean_elements import get_mean_elements
+from .sampling import sample_closed
 from .states import BaseState, ClassicalState, ModifiedEquinoctialState, RVState
 
 try:
@@ -42,7 +44,7 @@ except ImportError:
 
 ORBIT_FORMAT = "{r_p:.0f} x {r_a:.0f} x {inc:.1f} ({frame}) orbit around {body} at epoch {epoch} ({scale})"
 # String representation for orbits around bodies without predefined
-# reference frame
+# Reference frame
 ORBIT_NO_FRAME_FORMAT = (
     "{r_p:.0f} x {r_a:.0f} x {inc:.1f} orbit around {body} at epoch {epoch} ({scale})"
 )
@@ -211,14 +213,17 @@ class Orbit:
         return arglat
 
     @cached_property
-    def M(self):
-        """Mean anomaly. """
-        return nu_to_M(self.nu, self.ecc)
-
-    @cached_property
     def t_p(self):
         """Elapsed time since latest perifocal passage. """
-        t_p = self.period * self.M / (360 * u.deg)
+        t_p = (
+            delta_t_from_nu_fast(
+                self.nu.to_value(u.rad),
+                self.ecc.value,
+                self.attractor.k.to_value(u.km ** 3 / u.s ** 2),
+                self.r_p.to_value(u.km),
+            )
+            * u.s
+        )
         return t_p
 
     @classmethod
@@ -351,6 +356,12 @@ class Orbit:
         if ecc > 1 and a > 0:
             raise ValueError("Hyperbolic orbits have negative semimajor axis")
 
+        if not -np.pi * u.rad <= nu < np.pi * u.rad:
+            warn("Wrapping true anomaly to -π <= nu < π", stacklevel=2)
+            nu = ((nu + np.pi * u.rad) % (2 * np.pi * u.rad) - np.pi * u.rad).to(
+                nu.unit
+            )
+
         ss = ClassicalState(
             attractor, a * (1 - ecc ** 2), ecc, inc, raan, argp, nu, plane
         )
@@ -390,14 +401,12 @@ class Orbit:
 
     @classmethod
     def from_body_ephem(cls, body, epoch=None):
-        """Return osculating `Orbit` of a body at a given time.
-
-        """
+        """Return osculating `Orbit` of a body at a given time."""
         from poliastro.bodies import Earth, Moon, Sun
 
         warn(
             "Orbit.from_body_ephem is deprecated and will be removed in a future release, "
-            "see https://github.com/poliastro/poliastro/issues/445 for discussion.",
+            "use Ephem.from_body instead",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -445,6 +454,25 @@ class Orbit:
 
         return ss
 
+    @classmethod
+    def from_ephem(cls, attractor, ephem, epoch):
+        """Create osculating orbit from ephemerides at a given epoch.
+
+        This will assume that the `Ephem` coordinates
+        are expressed with respect the given body.
+
+        Parameters
+        ----------
+        ephem : ~poliastro.ephem.Ephem
+            Ephemerides object to use.
+        attractor : ~poliastro.bodies.Body
+            Body to use as attractor.
+        epoch : ~astropy.time.Time
+            Epoch to retrieve the osculating orbit at.
+
+        """
+        return cls.from_vectors(attractor, *ephem.rv(epoch), epoch, ephem.plane)
+
     def get_frame(self):
         """Get equivalent reference frame of the orbit.
 
@@ -480,7 +508,7 @@ class Orbit:
         elif self.attractor == new_attractor.parent:  # "Sun -> Earth"
             r_soi = laplace_radius(new_attractor)
             barycentric_position = get_body_barycentric(new_attractor.name, self.epoch)
-            # transforming new_attractor's frame into frame of attractor
+            # Transforming new_attractor's frame into frame of attractor
             new_attractor_r = (
                 ICRS(barycentric_position)
                 .transform_to(self.get_frame())
@@ -562,6 +590,13 @@ class Orbit:
             for Planets and Satellites.
 
         """
+        warn(
+            "Orbit.from_horizons is deprecated and will be removed in a future release, "
+            "use Ephem.from_horizons instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         if not epoch:
             epoch = time.Time.now()
         if plane == Planes.EARTH_EQUATOR:
@@ -621,11 +656,11 @@ class Orbit:
         obj = SBDB.query(name, full_precision=True, **kwargs)
 
         if "count" in obj:
-            # no error till now ---> more than one object has been found
-            # contains all the name of the objects
+            # No error till now ---> more than one object has been found
+            # Contains all the name of the objects
             objects_name = obj["list"]["name"]
             objects_name_in_str = (
-                ""  # used to store them in string form each in new line
+                ""  # Used to store them in string form each in new line
             )
             for i in objects_name:
                 objects_name_in_str += i + "\n"
@@ -634,6 +669,9 @@ class Orbit:
                 str(obj["count"]) + " different objects found: \n" + objects_name_in_str
             )
 
+        if "object" not in obj.keys():
+            raise ValueError("Object {} not found".format(name))
+
         a = obj["orbit"]["elements"]["a"].to(u.AU) * u.AU
         ecc = float(obj["orbit"]["elements"]["e"]) * u.one
         inc = obj["orbit"]["elements"]["i"].to(u.deg) * u.deg
@@ -641,8 +679,17 @@ class Orbit:
         argp = obj["orbit"]["elements"]["w"].to(u.deg) * u.deg
 
         # Since JPL provides Mean Anomaly (M) we need to make
-        # the conversion to the true anomaly (\nu)
-        nu = M_to_nu(obj["orbit"]["elements"]["ma"].to(u.deg) * u.deg, ecc)
+        # the conversion to the true anomaly (nu)
+        M = obj["orbit"]["elements"]["ma"].to(u.rad) * u.rad
+        # NOTE: It is unclear how this conversion should happen,
+        # see https://ssd-api.jpl.nasa.gov/doc/sbdb.html
+        if ecc < 1:
+            M = (M + np.pi * u.rad) % (2 * np.pi * u.rad) - np.pi * u.rad
+            nu = E_to_nu(M_to_E(M, ecc), ecc)
+        elif ecc == 1:
+            nu = D_to_nu(M_to_D(M))
+        else:
+            nu = F_to_nu(M_to_F(M, ecc), ecc)
 
         epoch = time.Time(obj["orbit"]["epoch"].to(u.d), format="jd")
 
@@ -701,49 +748,109 @@ class Orbit:
         )
 
     @classmethod
-    @u.quantity_input(angular_velocity=u.rad / u.s, period=u.s, hill_radius=u.m)
-    def geostationary(
-        cls, attractor, angular_velocity=None, period=None, hill_radius=None
-    ):
-        """Return the geostationary orbit for the given attractor and its rotational speed.
+    def stationary(cls, attractor):
+        """Return the stationary orbit for the given attractor and its rotational speed.
 
         Parameters
         ----------
         attractor : Body
             Main attractor.
-        angular_velocity : ~astropy.units.Quantity
-            Rotational angular velocity of the attractor.
-        period : ~astropy.units.Quantity
-            Attractor's rotational period, ignored if angular_velocity is passed.
-        hill_radius : ~astropy.units.Quantity
-            Radius of Hill sphere of the attractor (optional). Hill sphere radius(in
-            contrast with Laplace's SOI) is used here to validate the stability of the
-            geostationary orbit, that is to make sure that the orbital radius required
-            for the geostationary orbit is not outside of the gravitational sphere of
-            influence of the attractor.
-            Hill SOI of parent(if exists) of the attractor is ignored if hill_radius is not provided.
+
+        Returns
+        -------
+        Orbit
+            New orbit.
+
+
         """
+        return cls.synchronous(attractor)
 
-        if angular_velocity is None and period is None:
-            raise ValueError(
-                "At least one among angular_velocity or period must be passed"
-            )
+    @classmethod
+    @u.quantity_input(
+        ecc=u.one,
+        inc=u.deg,
+        argp=u.deg,
+        arglat=u.deg,
+        raan=u.deg,
+        period_mul=u.one,
+    )
+    def synchronous(
+        cls,
+        attractor,
+        period_mul=1 * u.one,
+        ecc=0 * u.one,
+        inc=0 * u.deg,
+        argp=0 * u.deg,
+        arglat=0 * u.deg,
+        raan=0 * u.deg,
+        epoch=J2000,
+        plane=Planes.EARTH_EQUATOR,
+    ):
+        r""" Returns an orbit where the orbital period equals the rotation rate
+        of the orbited body.  The synchronous altitude for any central body can
+        directly be obtained from Kepler's Third Law by setting the orbit period
+        P\ :sub:`sync`, equal to the rotation period of the central body
+        relative to the fixed stars D\ :sup:`*`. In order to obtain this, it's
+        important to match orbital period with sidereal rotation period.
 
-        if angular_velocity is None:
-            angular_velocity = 2 * np.pi / period
+        Parameters
+        ----------
+        attractor : Body
+            Main attractor.
+        period_mul : ~astropy.units.Quantity
+            Multiplier, default to 1 to indicate that the period of the body is
+            equal to the sidereal rotational period of the body being orbited,
+            0.5 a period equal to half the average rotational period of the body
+            being orbited, indicates a semi-synchronous orbit.
+        ecc : ~astropy.units.Quantity
+            Eccentricity,default to 0 as a stationary orbit.
+        inc : ~astropy.units.Quantity
+            Inclination,default to 0 deg.
+        raan : ~astropy.units.Quantity
+            Right ascension of the ascending node,default to 0 deg.
+        argp : ~astropy.units.Quantity
+            Argument of the pericenter,default to 0 deg.
+        arglat : ~astropy.units.Quantity, optional
+            Argument of latitude, default to 0 deg.
+        epoch : ~astropy.time.Time, optional
+            Epoch, default to J2000.
+        plane : ~poliastro.frames.Planes
+            Fundamental plane of the frame.
 
-        # Find out geostationary radius using r = cube_root(GM/(angular
-        # velocity)^2)
-        with u.set_enabled_equivalencies(u.dimensionless_angles()):
-            geo_radius = np.cbrt(attractor.k / np.square(angular_velocity.to(1 / u.s)))
+        Returns
+        -------
+        Orbit
+            New orbit.
 
-        if hill_radius is not None and geo_radius > hill_radius:
-            raise ValueError(
-                "Geostationary orbit for the given parameters doesn't exist"
-            )
+        Raises
+        ------
+        ValueError
+            If the pericenter is smaller than the attractor's radius.
 
-        altitude = geo_radius - attractor.R
-        return cls.circular(attractor, altitude)
+        Notes
+        -----
+
+        Thus:
+
+        .. math::
+
+            P_{s y n c}=D^{*} \\
+
+            a_{s y n c}=\left(\mu / 4 \pi^{2}\right)^{1 / 3}\left(D^{*}\right)^{2 / 3}\\
+
+            H_{s y n c}=a_{s y n c} - R_{p l a n e t}\\
+
+        """
+        period_sync = attractor.rotational_period * period_mul
+        a_sync = (attractor.k * (period_sync / (2 * np.pi)) ** 2) ** (1 / 3)
+        nu = arglat - argp
+        r_pericenter = (1 - ecc) * a_sync
+        if r_pericenter < attractor.R:
+            raise ValueError("The orbit for the given parameters doesn't exist")
+
+        return cls.from_classical(
+            attractor, a_sync, ecc, inc, raan, argp, nu, epoch, plane
+        )
 
     @classmethod
     def heliosynchronous(
@@ -792,6 +899,7 @@ class Orbit:
             Epoch, default to J2000.
         plane : ~poliastro.frames.Planes
             Fundamental plane of the frame.
+
         """
         mean_elements = get_mean_elements(attractor)
 
@@ -858,7 +966,7 @@ class Orbit:
     def parabolic(
         cls, attractor, p, inc, raan, argp, nu, epoch=J2000, plane=Planes.EARTH_EQUATOR
     ):
-        """Return parabolic `Orbit`.
+        """Return a parabolic `Orbit`.
 
         Parameters
         ----------
@@ -899,7 +1007,7 @@ class Orbit:
         epoch=J2000,
         plane=Planes.EARTH_EQUATOR,
     ):
-        r"""Return frozen Orbit. If any of the given arguments results in an impossibility, some values will be overwritten
+        r"""Return a frozen Orbit. If any of the given arguments results in an impossibility, some values will be overwritten
 
         To achieve frozen orbit these two equations have to be set to zero.
 
@@ -1129,7 +1237,7 @@ class Orbit:
     def __repr__(self):
         return self.__str__()
 
-    def propagate(self, value, method=mean_motion, rtol=1e-10, **kwargs):
+    def propagate(self, value, method=farnocchia, rtol=1e-10, **kwargs):
         """Propagates an orbit a specified time.
 
         If value is true anomaly, propagate orbit to this anomaly and return the result.
@@ -1181,13 +1289,21 @@ class Orbit:
         -------
         tof: ~astropy.units.Quantity
             Time of flight required.
+
         """
+        # Silently wrap anomaly
+        nu = (value + np.pi * u.rad) % (2 * np.pi * u.rad) - np.pi * u.rad
 
-        # Compute time of flight for correct epoch
-        M = nu_to_M(self.nu, self.ecc)
-        new_M = nu_to_M(value, self.ecc)
-        tof = Angle(new_M - M).wrap_at(360 * u.deg) / self.n
-
+        delta_t = (
+            delta_t_from_nu_fast(
+                nu.to_value(u.rad),
+                self.ecc.value,
+                self.attractor.k.to_value(u.km ** 3 / u.s ** 2),
+                self.r_p.to_value(u.km),
+            )
+            * u.s
+        )
+        tof = delta_t - self.t_p
         return tof
 
     @u.quantity_input(value=u.rad)
@@ -1204,9 +1320,19 @@ class Orbit:
             Resulting orbit after propagation.
 
         """
+        # Silently wrap anomaly
+        nu = (value + np.pi * u.rad) % (2 * np.pi * u.rad) - np.pi * u.rad
 
         # Compute time of flight for correct epoch
-        time_of_flight = self.time_to_anomaly(value)
+        time_of_flight = self.time_to_anomaly(nu)
+
+        if time_of_flight < 0:
+            if self.ecc >= 1:
+                raise ValueError("True anomaly {:.2f} not reachable".format(value))
+            else:
+                # For a closed orbit, instead of moving backwards
+                # we need to do another revolution
+                time_of_flight = self.period + time_of_flight
 
         return self.from_classical(
             self.attractor,
@@ -1215,31 +1341,10 @@ class Orbit:
             self.inc,
             self.raan,
             self.argp,
-            value,
+            nu,
             epoch=self.epoch + time_of_flight,
             plane=self.plane,
         )
-
-    def _sample_closed(self, values, min_anomaly, max_anomaly):
-        min_anomaly = (
-            min_anomaly.to(u.rad).value
-            if min_anomaly is not None
-            else self.nu.to(u.rad).value
-        )
-        max_anomaly = (
-            max_anomaly.to(u.rad).value
-            if max_anomaly is not None
-            else self.nu.to(u.rad).value + 2 * np.pi
-        )
-        limits = [min_anomaly, max_anomaly] * u.rad
-
-        # First sample eccentric anomaly, then transform into true anomaly
-        # to minimize error in the apocenter, see
-        # http://www.dtic.mil/dtic/tr/fulltext/u2/a605040.pdf
-        # Start from pericenter
-        E_values = np.linspace(*limits, values)
-        nu_values = E_to_nu(E_values, self.ecc)
-        return nu_values
 
     def _sample_open(self, values, min_anomaly, max_anomaly):
         # Select a sensible limiting value for non-closed orbits
@@ -1262,7 +1367,7 @@ class Orbit:
             warn("anomaly outside range, clipping", OrbitSamplingWarning, stacklevel=2)
             limits = limits.clip(-nu_max, nu_max)
 
-        nu_values = np.linspace(*limits, values)
+        nu_values = np.linspace(*limits, values)  # type: ignore
         return nu_values
 
     def sample(self, values=100, *, min_anomaly=None, max_anomaly=None):
@@ -1303,26 +1408,46 @@ class Orbit:
 
         """
         if self.ecc < 1:
-            nu_values = self._sample_closed(values, min_anomaly, max_anomaly)
+            nu_values = sample_closed(
+                min_anomaly if min_anomaly is not None else self.nu,
+                self.ecc,
+                max_anomaly,
+                values,
+            )
         else:
             nu_values = self._sample_open(values, min_anomaly, max_anomaly)
 
-        time_values = time.TimeDelta(self._generate_time_values(nu_values))
-        cartesian = propagate(self, time_values)
+        n = nu_values.shape[0]
+        rr, vv = coe2rv_many(
+            np.full(n, self.attractor.k.to(u.m ** 3 / u.s ** 2).value),
+            np.full(n, self.p.to(u.m).value),
+            np.full(n, self.ecc.value),
+            np.full(n, self.inc.to(u.rad).value),
+            np.full(n, self.raan.to(u.rad).value),
+            np.full(n, self.argp.to(u.rad).value),
+            nu_values.to(u.rad).value,
+        )
+
+        # Add units
+        rr = (rr << u.m).to(u.km)
+        vv = (vv << (u.m / u.s)).to(u.km / u.s)
+
+        cartesian = CartesianRepresentation(
+            rr, differentials=CartesianDifferential(vv, xyz_axis=1), xyz_axis=1
+        )
 
         return cartesian
 
     def _generate_time_values(self, nu_vals):
         # Subtract current anomaly to start from the desired point
         ecc = self.ecc.value
-        nu = self.nu.to(u.rad).value
+        k = self.attractor.k.to_value(u.km ** 3 / u.s ** 2)
+        q = self.r_p.to_value(u.km)
 
-        M_vals = [
-            nu_to_M_fast(nu_val, ecc) - nu_to_M_fast(nu, ecc)
+        time_values = [
+            delta_t_from_nu_fast(nu_val, ecc, k, q)
             for nu_val in nu_vals.to(u.rad).value
-        ] * u.rad
-
-        time_values = (M_vals / self.n).decompose()
+        ] * u.s - self.t_p
         return time_values
 
     def apply_maneuver(self, maneuver, intermediate=False):

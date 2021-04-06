@@ -14,33 +14,38 @@ from poliastro.core.elements import rv2coe
 from poliastro.core.perturbations import (
     J2_perturbation,
     J3_perturbation,
-    atmospheric_drag,
+    atmospheric_drag_exponential,
+    atmospheric_drag_model,
     radiation_pressure,
     third_body,
 )
+from poliastro.core.propagation import func_twobody
+from poliastro.earth.atmosphere import COESA76
 from poliastro.ephem import build_ephem_interpolant
 from poliastro.twobody import Orbit
+from poliastro.twobody.events import LithobrakeEvent
 from poliastro.twobody.propagation import cowell
 
 
 @pytest.mark.slow
 def test_J2_propagation_Earth():
-    # from Curtis example 12.2:
+    # From Curtis example 12.2:
     r0 = np.array([-2384.46, 5729.01, 3050.46])  # km
     v0 = np.array([-7.36138, -2.98997, 1.64354])  # km/s
 
     orbit = Orbit.from_vectors(Earth, r0 * u.km, v0 * u.km / u.s)
 
     tofs = [48.0] * u.h
-    rr, vv = cowell(
-        Earth.k,
-        orbit.r,
-        orbit.v,
-        tofs,
-        ad=J2_perturbation,
-        J2=Earth.J2.value,
-        R=Earth.R.to(u.km).value,
-    )
+
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = J2_perturbation(
+            t0, u_, k, J2=Earth.J2.value, R=Earth.R.to(u.km).value
+        )
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
+    rr, vv = cowell(Earth.k, orbit.r, orbit.v, tofs, f=f)
 
     k = Earth.k.to(u.km ** 3 / u.s ** 2).value
 
@@ -104,24 +109,33 @@ def test_J3_propagation_Earth(test_params):
         Earth, a_ini, ecc_ini, inc_ini, raan_ini, argp_ini, nu_ini
     )
 
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = J2_perturbation(
+            t0, u_, k, J2=Earth.J2.value, R=Earth.R.to(u.km).value
+        )
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
     tofs = np.linspace(0, 10.0 * u.day, 1000)
     r_J2, v_J2 = cowell(
         Earth.k,
         orbit.r,
         orbit.v,
         tofs,
-        ad=J2_perturbation,
-        J2=Earth.J2.value,
-        R=Earth.R.to(u.km).value,
         rtol=1e-8,
+        f=f,
     )
 
-    def a_J2J3(t0, u_, k_):
-        j2 = J2_perturbation(t0, u_, k_, J2=Earth.J2.value, R=Earth.R.to(u.km).value)
-        j3 = J3_perturbation(t0, u_, k_, J3=Earth.J3.value, R=Earth.R.to(u.km).value)
-        return j2 + j3
+    def f_combined(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = J2_perturbation(
+            t0, u_, k, J2=Earth.J2.value, R=Earth.R.to_value(u.km)
+        ) + J3_perturbation(t0, u_, k, J3=Earth.J3.value, R=Earth.R.to_value(u.km))
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
 
-    r_J3, v_J3 = cowell(Earth.k, orbit.r, orbit.v, tofs, ad=a_J2J3, rtol=1e-8)
+    r_J3, v_J3 = cowell(Earth.k, orbit.r, orbit.v, tofs, rtol=1e-8, f=f_combined)
 
     a_values_J2 = np.array(
         [
@@ -174,53 +188,158 @@ def test_J3_propagation_Earth(test_params):
 
 
 @pytest.mark.slow
-def test_atmospheric_drag():
+def test_atmospheric_drag_exponential():
     # http://farside.ph.utexas.edu/teaching/celestial/Celestialhtml/node94.html#sair (10.148)
-    # given the expression for \dot{r} / r, aproximate \Delta r \approx F_r * \Delta t
+    # Given the expression for \dot{r} / r, aproximate \Delta r \approx F_r * \Delta t
 
     R = Earth.R.to(u.km).value
     k = Earth.k.to(u.km ** 3 / u.s ** 2).value
 
-    # parameters of a circular orbit with h = 250 km (any value would do, but not too small)
+    # Parameters of a circular orbit with h = 250 km (any value would do, but not too small)
     orbit = Orbit.circular(Earth, 250 * u.km)
     r0, _ = orbit.rv()
     r0 = r0.to(u.km).value
 
-    # parameters of a body
+    # Parameters of a body
     C_D = 2.2  # dimentionless (any value would do)
-    A = ((np.pi / 4.0) * (u.m ** 2)).to(u.km ** 2).value  # km^2
-    m = 100  # kg
-    B = C_D * A / m
+    A_over_m = ((np.pi / 4.0) * (u.m ** 2) / (100 * u.kg)).to_value(
+        u.km ** 2 / u.kg
+    )  # km^2/kg
+    B = C_D * A_over_m
 
-    # parameters of the atmosphere
-    rho0 = rho0_earth.value  # kg/km^3
-    H0 = H0_earth.value
+    # Parameters of the atmosphere
+    rho0 = rho0_earth.to(u.kg / u.km ** 3).value  # kg/km^3
+    H0 = H0_earth.to(u.km).value  # km
     tof = 100000  # s
 
-    dr_expected = (
-        -B * rho0_earth * np.exp(-(norm(r0) - R) / H0) * np.sqrt(k * norm(r0)) * tof
-    )
-    # assuming the atmospheric decay during tof is small,
+    dr_expected = -B * rho0 * np.exp(-(norm(r0) - R) / H0) * np.sqrt(k * norm(r0)) * tof
+    # Assuming the atmospheric decay during tof is small,
     # dr_expected = F_r * tof (Newton's integration formula), where
     # F_r = -B rho(r) |r|^2 sqrt(k / |r|^3) = -B rho(r) sqrt(k |r|)
+
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = atmospheric_drag_exponential(
+            t0, u_, k, R=R, C_D=C_D, A_over_m=A_over_m, H0=H0, rho0=rho0
+        )
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
 
     rr, _ = cowell(
         Earth.k,
         orbit.r,
         orbit.v,
         [tof] * u.s,
-        ad=atmospheric_drag,
-        R=R,
-        C_D=C_D,
-        A=A,
-        m=m,
-        H0=H0,
-        rho0=rho0,
+        f=f,
     )
 
     assert_quantity_allclose(
-        norm(rr[0].to(u.km).value) - norm(r0), dr_expected.value, rtol=1e-2
+        norm(rr[0].to(u.km).value) - norm(r0), dr_expected, rtol=1e-2
     )
+
+
+@pytest.mark.slow
+def test_atmospheric_demise():
+    # Test an orbital decay that hits Earth. No analytic solution.
+    R = Earth.R.to(u.km).value
+
+    orbit = Orbit.circular(Earth, 230 * u.km)
+    t_decay = 48.2179 * u.d  # not an analytic value
+
+    # Parameters of a body
+    C_D = 2.2  # dimentionless (any value would do)
+    A_over_m = ((np.pi / 4.0) * (u.m ** 2) / (100 * u.kg)).to_value(
+        u.km ** 2 / u.kg
+    )  # km^2/kg
+
+    # Parameters of the atmosphere
+    rho0 = rho0_earth.to(u.kg / u.km ** 3).value  # kg/km^3
+    H0 = H0_earth.to(u.km).value  # km
+
+    tofs = [365] * u.d  # Actually hits the ground a bit after day 48
+
+    lithobrake_event = LithobrakeEvent(R)
+    events = [lithobrake_event]
+
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = atmospheric_drag_exponential(
+            t0, u_, k, R=R, C_D=C_D, A_over_m=A_over_m, H0=H0, rho0=rho0
+        )
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
+    rr, _ = cowell(
+        Earth.k,
+        orbit.r,
+        orbit.v,
+        tofs,
+        events=events,
+        f=f,
+    )
+
+    assert_quantity_allclose(norm(rr[0].to(u.km).value), R, atol=1)  # Below 1km
+
+    assert_quantity_allclose(lithobrake_event.last_t, t_decay, rtol=1e-2)
+
+    # Make sure having the event not firing is ok
+    tofs = [1] * u.d
+    lithobrake_event = LithobrakeEvent(R)
+    events = [lithobrake_event]
+
+    rr, _ = cowell(
+        Earth.k,
+        orbit.r,
+        orbit.v,
+        tofs,
+        events=events,
+        f=f,
+    )
+
+    assert lithobrake_event.last_t == tofs[-1]
+
+
+@pytest.mark.slow
+def test_atmospheric_demise_coesa76():
+    # Test an orbital decay that hits Earth. No analytic solution.
+    R = Earth.R.to(u.km).value
+
+    orbit = Orbit.circular(Earth, 250 * u.km)
+    t_decay = 7.17 * u.d
+
+    # Parameters of a body
+    C_D = 2.2  # Dimensionless (any value would do)
+    A_over_m = ((np.pi / 4.0) * (u.m ** 2) / (100 * u.kg)).to_value(
+        u.km ** 2 / u.kg
+    )  # km^2/kg
+
+    tofs = [365] * u.d
+
+    lithobrake_event = LithobrakeEvent(R)
+    events = [lithobrake_event]
+
+    coesa76 = COESA76()
+
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = atmospheric_drag_model(
+            t0, u_, k, R=R, C_D=C_D, A_over_m=A_over_m, model=coesa76
+        )
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
+    rr, _ = cowell(
+        Earth.k,
+        orbit.r,
+        orbit.v,
+        tofs,
+        events=events,
+        f=f,
+    )
+
+    assert_quantity_allclose(norm(rr[0].to(u.km).value), R, atol=1)  # Below 1km
+
+    assert_quantity_allclose(lithobrake_event.last_t, t_decay, rtol=1e-2)
 
 
 @pytest.mark.slow
@@ -246,7 +365,13 @@ def test_cowell_works_with_small_perturbations():
         norm_v = (v_vec * v_vec).sum() ** 0.5
         return 1e-5 * v_vec / norm_v
 
-    final = initial.propagate(3 * u.day, method=cowell, ad=accel)
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = accel(t0, u_, k)
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
+    final = initial.propagate(3 * u.day, method=cowell, f=f)
 
     assert_quantity_allclose(final.r, r_expected)
     assert_quantity_allclose(final.v, v_expected)
@@ -264,7 +389,13 @@ def test_cowell_converges_with_small_perturbations():
         norm_v = (v_vec * v_vec).sum() ** 0.5
         return 0.0 * v_vec / norm_v
 
-    final = initial.propagate(initial.period, method=cowell, ad=accel)
+    def f(t0, u_, k):
+        du_kep = func_twobody(t0, u_, k)
+        ax, ay, az = accel(t0, u_, k)
+        du_ad = np.array([0, 0, 0, ax, ay, az])
+        return du_kep + du_ad
+
+    final = initial.propagate(initial.period, method=cowell, f=f)
 
     assert_quantity_allclose(final.r, initial.r)
     assert_quantity_allclose(final.v, initial.v)
@@ -391,7 +522,7 @@ sun_geo = {
     ],
 )
 def test_3rd_body_Curtis(test_params):
-    # based on example 12.11 from Howard Curtis
+    # Based on example 12.11 from Howard Curtis
     body = test_params["body"]
     with solar_system_ephemeris.set("builtin"):
         j_date = 2454283.0 * u.day
@@ -405,15 +536,26 @@ def test_3rd_body_Curtis(test_params):
 
         epoch = Time(j_date, format="jd", scale="tdb")
         initial = Orbit.from_classical(Earth, *test_params["orbit"], epoch=epoch)
+
+        def f(t0, u_, k):
+            du_kep = func_twobody(t0, u_, k)
+            ax, ay, az = third_body(
+                t0,
+                u_,
+                k,
+                k_third=body.k.to(u.km ** 3 / u.s ** 2).value,
+                perturbation_body=body_r,
+            )
+            du_ad = np.array([0, 0, 0, ax, ay, az])
+            return du_kep + du_ad
+
         rr, vv = cowell(
             Earth.k,
             initial.r,
             initial.v,
             np.linspace(0, tof, 400) * u.s,
             rtol=1e-10,
-            ad=third_body,
-            k_third=body.k.to(u.km ** 3 / u.s ** 2).value,
-            third_body=body_r,
+            f=f,
         )
 
         incs, raans, argps = [], [], []
@@ -426,7 +568,7 @@ def test_3rd_body_Curtis(test_params):
             raans.append(angles[1].value)
             argps.append(angles[2].value)
 
-        # averaging over 5 last values in the way Curtis does
+        # Averaging over 5 last values in the way Curtis does
         inc_f, raan_f, argp_f = (
             np.mean(incs[-5:]),
             np.mean(raans[-5:]),
@@ -469,24 +611,40 @@ def normalize_to_Curtis(t0, sun_r):
     ],
 )
 def test_solar_pressure(t_days, deltas_expected, sun_r):
-    # based on example 12.9 from Howard Curtis
+    # Based on example 12.9 from Howard Curtis
     with solar_system_ephemeris.set("builtin"):
         j_date = 2_438_400.5 * u.day
         tof = 600 * u.day
         epoch = Time(j_date, format="jd", scale="tdb")
 
-        initial = Orbit.from_classical(
-            Earth,
-            10085.44 * u.km,
-            0.025422 * u.one,
-            88.3924 * u.deg,
-            45.38124 * u.deg,
-            227.493 * u.deg,
-            343.4268 * u.deg,
-            epoch=epoch,
-        )
-        # in Curtis, the mean distance to Sun is used. In order to validate against it, we have to do the same thing
+        with pytest.warns(UserWarning, match="Wrapping true anomaly to -π <= nu < π"):
+            initial = Orbit.from_classical(
+                Earth,
+                10085.44 * u.km,
+                0.025422 * u.one,
+                88.3924 * u.deg,
+                45.38124 * u.deg,
+                227.493 * u.deg,
+                343.4268 * u.deg,
+                epoch=epoch,
+            )
+        # In Curtis, the mean distance to Sun is used. In order to validate against it, we have to do the same thing
         sun_normalized = functools.partial(normalize_to_Curtis, sun_r=sun_r)
+
+        def f(t0, u_, k):
+            du_kep = func_twobody(t0, u_, k)
+            ax, ay, az = radiation_pressure(
+                t0,
+                u_,
+                k,
+                R=Earth.R.to(u.km).value,
+                C_R=2.0,
+                A_over_m=2e-4 / 100,
+                Wdivc_s=Wdivc_sun.value,
+                star=sun_normalized,
+            )
+            du_ad = np.array([0, 0, 0, ax, ay, az])
+            return du_kep + du_ad
 
         rr, vv = cowell(
             Earth.k,
@@ -494,13 +652,7 @@ def test_solar_pressure(t_days, deltas_expected, sun_r):
             initial.v,
             np.linspace(0, (tof).to(u.s).value, 4000) * u.s,
             rtol=1e-8,
-            ad=radiation_pressure,
-            R=Earth.R.to(u.km).value,
-            C_R=2.0,
-            A=2e-4,
-            m=100,
-            Wdivc_s=Wdivc_sun.value,
-            star=sun_normalized,
+            f=f,
         )
 
         delta_eccs, delta_incs, delta_raans, delta_argps = [], [], [], []
@@ -517,10 +669,8 @@ def test_solar_pressure(t_days, deltas_expected, sun_r):
                 (orbit_params[4] * u.rad).to(u.deg).value - initial.argp.value
             )
 
-        # averaging over 5 last values in the way Curtis does
-        index = int(
-            1.0 * t_days / tof.to(u.day).value * 4000  # type: ignore
-        )
+        # Averaging over 5 last values in the way Curtis does
+        index = int(1.0 * t_days / tof.to(u.day).value * 4000)  # type: ignore
         delta_ecc, delta_inc, delta_raan, delta_argp = (
             np.mean(delta_eccs[index - 5 : index]),
             np.mean(delta_incs[index - 5 : index]),
